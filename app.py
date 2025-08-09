@@ -6,13 +6,14 @@ from urllib.parse import urlparse, parse_qs
 import httpx
 from dash import Dash, html, dcc, Input, Output, State
 from flask import send_file
+from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 
 DG_KEY = os.getenv("DEEPGRAM_API_KEY")
 if not DG_KEY:
-    print("WARN: DEEPGRAM_API_KEY fehlt – Transkription wird fehlschlagen.")
+    print("WARN: DEEPGRAM_API_KEY fehlt – Deepgram-Fallback wird fehlschlagen.")
 
 app = Dash(__name__)
-server = app.server  # für Render
+server = app.server  # Render
 
 # ---------- Helpers ----------
 def is_valid_youtube_url(url: str) -> bool:
@@ -26,19 +27,82 @@ def is_valid_youtube_url(url: str) -> bool:
         path = (p.path or "")
         if "youtube.com" in host:
             qs = parse_qs(p.query or "")
-            if path.startswith("/watch"):
+            if path.startswith("/watch"):  # ?v=ID
                 return "v" in qs and len(qs["v"][0]) > 5
             if path.startswith("/shorts/") and len(path.split("/")[2]) >= 5:
                 return True
             if path.startswith("/live/") and len(path.split("/")[2]) >= 5:
                 return True
             return False
-        if "youtu.be" in host:
-            parts = [seg for seg in path.split("/") if seg]
+        if "youtu.be" in host:  # youtu.be/ID
+            parts = [seg for seg in (p.path or "").split("/") if seg]
             return len(parts) == 1 and len(parts[0]) >= 5
         return False
     except Exception:
         return False
+
+def get_video_id(url: str) -> str | None:
+    p = urlparse(url)
+    host = (p.netloc or "").lower()
+    path = (p.path or "")
+    if "youtube.com" in host and path.startswith("/watch"):
+        qs = parse_qs(p.query or "")
+        return qs.get("v", [None])[0]
+    if "youtu.be" in host:
+        parts = [seg for seg in path.split("/") if seg]
+        return parts[0] if parts else None
+    if "youtube.com" in host and path.startswith("/shorts/"):
+        return path.split("/")[2]
+    if "youtube.com" in host and path.startswith("/live/"):
+        return path.split("/")[2]
+    return None
+
+def fetch_youtube_captions(video_id: str, prefer_langs=("de","en")) -> str | None:
+    """A: Captions-First. Holt vorhandene Untertitel (auch auto) ohne Login. Gibt reinen Text zurück."""
+    try:
+        tl = YouTubeTranscriptApi.list_transcripts(video_id)
+        # 1) Manuell gepflegte Transkripte in bevorzugter Sprache
+        for lang in prefer_langs:
+            try:
+                tr = tl.find_transcript([lang])
+                chunks = tr.fetch()
+                txt = " ".join(c["text"] for c in chunks if c.get("text")).strip()
+                if txt:
+                    return txt
+            except Exception:
+                pass
+        # 2) Auto-generierte in bevorzugter Sprache
+        for lang in prefer_langs:
+            try:
+                tr = tl.find_manually_created_transcript([lang])  # if exists, we already tried; continue
+            except Exception:
+                pass
+            try:
+                # auto transcript (might need translate if source differs)
+                # try any transcript then translate
+                for tr in tl:
+                    try:
+                        tr2 = tr.translate(lang)
+                        chunks = tr2.fetch()
+                        txt = " ".join(c["text"] for c in chunks if c.get("text")).strip()
+                        if txt:
+                            return txt
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+        # 3) Fallback: nimm irgendein verfügbares Transcript
+        try:
+            any_tr = next(iter(tl))
+            chunks = any_tr.fetch()
+            txt = " ".join(c["text"] for c in chunks if c.get("text")).strip()
+            return txt or None
+        except Exception:
+            return None
+    except (TranscriptsDisabled, NoTranscriptFound):
+        return None
+    except Exception:
+        return None
 
 def url_key(url: str) -> str:
     return hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
@@ -51,8 +115,16 @@ def paths_for(url: str):
     return key, raw, wav
 
 def download_audio(youtube_url: str, raw_out: str):
+    # B: Nur wenn keine Captions: yt-dlp versuchen
     from yt_dlp import YoutubeDL
-    ydl_opts = {"format": "bestaudio/best", "outtmpl": raw_out, "quiet": True}
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": raw_out,
+        "quiet": True,
+        "geo_bypass": True,
+        "nocheckcertificate": True,
+        # "extractor_args": {"youtube": {"player_client": ["android","web"]}},  # optional
+    }
     with YoutubeDL(ydl_opts) as ydl:
         ydl.download([youtube_url])
 
@@ -63,12 +135,11 @@ def to_wav_16k_mono(inp: str, outp: str):
     )
 
 async def deepgram_transcribe(wav_path: str) -> str:
-    """Gibt reinen Text zurück (ein String)."""
+    """C: Deepgram-Fallback – gibt reinen Text zurück."""
     headers = {"Authorization": f"Token {DG_KEY}"}
     params = {
         "punctuate": "true",
         "smart_format": "true",
-        # nur Text: keine Diarisierung nötig; Sprache automatisch erkennen
         "detect_language": "true",
     }
     async with httpx.AsyncClient(timeout=300) as cx:
@@ -79,20 +150,18 @@ async def deepgram_transcribe(wav_path: str) -> str:
             )
     r.raise_for_status()
     data = r.json()
-    # Robuster Zugriff auf den Gesamttext
     alt = (
         data.get("results", {})
             .get("channels", [{}])[0]
             .get("alternatives", [{}])[0]
     )
     transcript = alt.get("transcript") or ""
-    # Fallback: paragraphs zusammensetzen
     if not transcript:
         paras = alt.get("paragraphs", {}).get("paragraphs", [])
-        transcript = " ".join([p.get("text","") for p in paras if p.get("text")])
-    return transcript.strip()
+        transcript = " ".join(p.get("text","") for p in paras if p.get("text"))
+    return (transcript or "").strip()
 
-# ---------- Static serving: WAV ----------
+# ---------- Serve WAV if we used fallback ----------
 @server.route("/audio/<key>.wav")
 def serve_audio(key):
     wav = os.path.join("/tmp", f"audio_{key}.wav")
@@ -104,7 +173,7 @@ def serve_audio(key):
 app.layout = html.Div(
     style={"maxWidth": 780, "margin": "40px auto", "fontFamily": "system-ui, Arial"},
     children=[
-        html.H2("Schritt 2/3 – Tonspur + Transkript (Deepgram)"),
+        html.H2("Schritt 3 – Captions‑First → Fallback Deepgram"),
         html.Div(
             style={"display": "flex", "gap": "10px", "alignItems": "center"},
             children=[
@@ -123,99 +192,98 @@ app.layout = html.Div(
                 ),
             ],
         ),
-        html.Div(id="validity", style={"marginTop": "12px", "fontSize": "16px"}),
+        html.Div(id="status_url", style={"marginTop": "10px"}),
         html.Hr(),
-        html.Div(id="extract_status", style={"marginTop": "8px", "fontSize": "14px", "color": "#555"}),
+        html.Div(
+            style={"display": "flex", "gap": "10px", "alignItems": "center"},
+            children=[
+                html.Button(
+                    "Transkribieren",
+                    id="transcribe_btn",
+                    n_clicks=0,
+                    style={"padding": "10px 14px", "borderRadius": "8px", "border": "1px solid #ddd", "cursor": "pointer"}
+                ),
+                html.Span(id="transcribe_status", style={"color": "#555"})
+            ],
+        ),
         html.Audio(id="player", src="", controls=True, style={"width": "100%", "marginTop": "8px"}),
-        html.Div(style={"marginTop": "10px"}, children=[
-            html.Button(
-                "Transkribieren",
-                id="transcribe_btn",
-                n_clicks=0,
-                style={"padding": "10px 14px", "borderRadius": "8px", "border": "1px solid #ddd", "cursor": "pointer"}
-            ),
-            html.Span(id="transcribe_status", style={"marginLeft": "12px", "color": "#555"})
-        ]),
         html.Div(id="transcript_text", style={"marginTop": "16px", "whiteSpace": "pre-wrap"}),
-        dcc.Store(id="audio_src"),
-        dcc.Store(id="audio_key"),
+        dcc.Store(id="video_id_store"),
+        dcc.Store(id="audio_key_store"),
     ],
 )
 
 # ---------- Callbacks ----------
 @app.callback(
-    Output("validity", "children"),
-    Output("validity", "style"),
-    Output("extract_status", "children"),
-    Output("audio_src", "data"),
-    Output("audio_key", "data"),
+    Output("status_url", "children"),
+    Output("video_id_store", "data"),
+    Output("audio_key_store", "data"),
     Input("submit", "n_clicks"),
     Input("url", "n_submit"),
     State("url", "value"),
     prevent_initial_call=True,
 )
-def validate_and_extract(n_clicks, n_submit, url):
+def validate_url(n_clicks, n_submit, url):
     _ = (n_clicks, n_submit)
     if not url or not is_valid_youtube_url(url):
-        return (
-            "❌ Keine gültige YouTube‑URL.",
-            {"color": "#b00020"}, "", None, None
-        )
+        return ("❌ Keine gültige YouTube‑URL.", None, None)
+    vid = get_video_id(url)
     key, raw, wav = paths_for(url)
+    # Wir EXTRAHIEREN NOCH NICHT — erst, wenn Captions fehlen
+    return ("✅ Gültige YouTube‑URL.", {"video_id": vid, "url": url}, {"key": key, "url": url})
+
+@app.callback(
+    Output("transcribe_status", "children"),
+    Output("transcript_text", "children"),
+    Output("player", "src"),
+    Input("transcribe_btn", "n_clicks"),
+    State("video_id_store", "data"),
+    State("audio_key_store", "data"),
+    prevent_initial_call=True,
+)
+def transcribe_flow(n, vid_data, key_data):
+    if not vid_data or not key_data:
+        return ("Bitte zuerst URL prüfen.", "", "")
+
+    video_id = vid_data.get("video_id")
+    url = vid_data.get("url")
+    key = key_data.get("key")
+    raw, wav = paths_for(url)[1:]
+
+    # A) Captions-First
+    caps = None
+    try:
+        caps = fetch_youtube_captions(video_id, ("de","en"))
+    except Exception:
+        caps = None
+
+    if caps:
+        # Bypass Audio – direkt Captions anzeigen
+        return ("Untertitel gefunden (Quelle: YouTube).", caps, "")
+
+    # B) Kein Caption → Audio extrahieren (yt-dlp)
     try:
         if not os.path.exists(raw):
             download_audio(url, raw)
         if not os.path.exists(wav):
             to_wav_16k_mono(raw, wav)
     except Exception as e:
-        return (
-            "⚠️ URL gültig, aber Extraktion fehlgeschlagen.",
-            {"color": "#b06500"}, f"Fehler: {e}", None, None
-        )
-    audio_url = f"/audio/{key}.wav"
-    return (
-        "✅ Gültige YouTube‑URL.",
-        {"color": "#0a7f3f"},
-        "Tonspur extrahiert (WAV 16kHz/mono).",
-        {"src": audio_url},
-        {"key": key},
-    )
+        msg = str(e)
+        if "Sign in to confirm you’re not a bot" in msg or "confirm you're not a bot" in msg:
+            return ("Dieses Video blockiert automatisches Abrufen. Bitte anderes Video testen.", "", "")
+        return (f"Extraktion fehlgeschlagen: {e}", "", "")
 
-@app.callback(
-    Output("player", "src"),
-    Input("audio_src", "data"),
-)
-def set_player_src(data):
-    if not data:
-        return ""
-    return data.get("src", "")
-
-@app.callback(
-    Output("transcribe_status", "children"),
-    Output("transcript_text", "children"),
-    Input("transcribe_btn", "n_clicks"),
-    State("audio_key", "data"),
-    prevent_initial_call=True,
-)
-def do_transcribe(n, key_data):
-    if not key_data:
-        return ("Bitte zuerst Tonspur extrahieren.", "")
+    # C) Deepgram-Transkription
     if not DG_KEY:
-        return ("Deepgram API‑Key fehlt.", "")
-    key = key_data.get("key")
-    wav = os.path.join("/tmp", f"audio_{key}.wav")
-    if not os.path.exists(wav):
-        return ("Audio nicht gefunden. Bitte erneut extrahieren.", "")
+        return ("Deepgram-Key fehlt – kann nicht transkribieren.", "", f"/audio/{key}.wav")
     try:
         import asyncio
-        text = asyncio.run(deepgram_transcribe(wav))  # Dash callback ist sync → einmal run
-        if not text:
-            return ("Transkription fertig (leer).", "")
-        return ("Transkription fertig.", text)
+        text = asyncio.run(deepgram_transcribe(wav))
+        return ("Transkription (Deepgram) fertig.", text or "(leer)", f"/audio/{key}.wav")
     except Exception as e:
-        return (f"Transkription fehlgeschlagen: {e}", "")
+        return (f"Transkription fehlgeschlagen: {e}", "", f"/audio/{key}.wav")
 
-# optional: Healthcheck für Render
+# optional Healthcheck
 @server.route("/healthz")
 def healthz():
     return "ok", 200
