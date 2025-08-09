@@ -1,0 +1,51 @@
+# Byte-compiled / cache files
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# VS Code settings
+.vscode/
+
+# Jupyter Notebooks checkpoints (falls vorhanden)
+.ipynb_checkpoints/
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Python egg metadata
+*.egg-info/
+*.egg
+
+# Logfiles
+*.log
+
+# Environments
+.env
+.env.*
+
+# Installer files
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Deployment
+build/
+dist/
+*.spec
+
+# Pytest
+.pytest_cache/
+
+# mypy
+.mypy_cache/
+
+# Gradio temporary files
+gradio_cached_examples/
+
+# Render.com specific (optional, falls du was temporäres ablegst)
+*.render/
