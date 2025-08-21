@@ -1,9 +1,6 @@
 import os
 from urllib.parse import urlparse, parse_qs
 
-import sys
-print(sys.version)
-
 import json
 import httpx
 from dash import Dash, html, dcc, dash_table, Input, Output, State
