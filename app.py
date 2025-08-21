@@ -97,9 +97,13 @@ async def openai_facts(text: str, lang_hint: str = "de"):
         "Du bist ein Faktenprüf-Assistent. "
         "Extrahiere NUR objektiv überprüfbare Aussagen (Zahlen/Daten/Fakten). "
         "Bewerte jede Aussage als 'richtig' | 'falsch' | 'unklar'. "
-        "Gib pro Eintrag 1–3 glaubwürdige Quellen-URLs an. "
-        "Keine Erklärsätze außerhalb der verlangten JSON-Struktur."
+        "Gib pro Eintrag 1–3 GLAUBWÜRDIGE QUELLEN als **vollständige, direkte URLs mit Protokoll** an "
+        "(z.B. https://bundesregierung.de/...; **keine** Startseiten wie https://bmwi.de, "
+        "**keine** URL-Kürzer, **keine** Platzhalter). "
+        "Wenn du keine spezifische Quelle nennen kannst, setze verdict='unklar' und sources=[]. "
+        "Keine Erklärsätze außerhalb der JSON-Struktur."
     )
+
     clipped = text[:12000]
     messages = [
         {"role": "system", "content": system},
@@ -107,39 +111,38 @@ async def openai_facts(text: str, lang_hint: str = "de"):
     ]
 
     schema = {
-    "name": "facts_response",
-    "schema": {
-        "type": "object",
-        "properties": {
-            "items": {
-                "type": "array",
+        "name": "facts_response",
+        "schema": {
+            "type": "object",
+            "properties": {
                 "items": {
-                    "type": "object",
-                    "required": ["claim", "verdict", "sources"],
-                    "properties": {
-                        "claim":   {"type": "string"},
-                        "verdict": {"type": "string", "enum": ["richtig", "falsch", "unklar"]},
-                        "sources": {
-                            "type": "array",
-                            "items": {
-                                "type": "string",
-                                # statt "format": "uri" -> Regex:
-                                "pattern": "^https?://\\S+$"
-                            },
-                            "minItems": 0,
-                            "maxItems": 3
-                        }
-                    },
-                    "additionalProperties": False
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["claim", "verdict", "sources"],
+                        "properties": {
+                            "claim":   {"type": "string"},
+                            "verdict": {"type": "string", "enum": ["richtig", "falsch", "unklar"]},
+                            "sources": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string",
+                                    # http(s) + keine Leerzeichen; Klammer-Schlusszeichen am Ende vermeiden
+                                    "pattern": "^https?://[^\\s)\\]}]+$"
+                                },
+                                "minItems": 0,
+                                "maxItems": 3
+                            }
+                        },
+                        "additionalProperties": False
+                    }
                 }
-            }
+            },
+            "required": ["items"],
+            "additionalProperties": False
         },
-        "required": ["items"],
-        "additionalProperties": False
-    },
-    "strict": True
-}
-
+        "strict": True
+    }
 
     headers = {"Authorization": f"Bearer {OPENAI_KEY}", "Content-Type": "application/json"}
     body = {
