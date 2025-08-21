@@ -1,21 +1,22 @@
 import os
-import hashlib
-import subprocess
 from urllib.parse import urlparse, parse_qs
 
+import sys
+print(sys.version)
+
+import json
 import httpx
-from dash import Dash, html, dcc, Input, Output, State
-from flask import send_file
+from dash import Dash, html, dcc, dash_table, Input, Output, State
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 
-DG_KEY = os.getenv("DEEPGRAM_API_KEY")
-if not DG_KEY:
-    print("WARN: DEEPGRAM_API_KEY fehlt – Deepgram-Fallback wird fehlschlagen.")
+OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_KEY:
+    print("WARN: OPENAI_API_KEY fehlt – die Faktenprüfung wird fehlschlagen.")
 
 app = Dash(__name__)
-server = app.server  # Render
+server = app.server #render
 
-# ---------- Helpers ----------
+# ---------- Utils ----------
 def is_valid_youtube_url(url: str) -> bool:
     if not url:
         return False
@@ -27,14 +28,14 @@ def is_valid_youtube_url(url: str) -> bool:
         path = (p.path or "")
         if "youtube.com" in host:
             qs = parse_qs(p.query or "")
-            if path.startswith("/watch"):  # ?v=ID
+            if path.startswith("/watch"):
                 return "v" in qs and len(qs["v"][0]) > 5
             if path.startswith("/shorts/") and len(path.split("/")[2]) >= 5:
                 return True
             if path.startswith("/live/") and len(path.split("/")[2]) >= 5:
                 return True
             return False
-        if "youtu.be" in host:  # youtu.be/ID
+        if "youtu.be" in host:
             parts = [seg for seg in (p.path or "").split("/") if seg]
             return len(parts) == 1 and len(parts[0]) >= 5
         return False
@@ -57,123 +58,124 @@ def get_video_id(url: str) -> str | None:
         return path.split("/")[2]
     return None
 
-def fetch_youtube_captions(video_id: str, prefer_langs=("de","en")) -> str | None:
-    """A: Captions-First. Holt vorhandene Untertitel (auch auto) ohne Login. Gibt reinen Text zurück."""
+def fetch_captions_simple(video_id: str):
+    """
+    Holt das YouTube-Transcript (ohne Audio), bevorzugt DE, dann EN.
+    Rückgabe: (text, lang) oder (None, None)
+    """
+    yt = YouTubeTranscriptApi()
     try:
-        tl = YouTubeTranscriptApi.list_transcripts(video_id)
-        # 1) Manuell gepflegte Transkripte in bevorzugter Sprache
-        for lang in prefer_langs:
+        for langs in (['de'], ['en'], ['de','en'], ['en','de']):
             try:
-                tr = tl.find_transcript([lang])
-                chunks = tr.fetch()
-                txt = " ".join(c["text"] for c in chunks if c.get("text")).strip()
-                if txt:
-                    return txt
-            except Exception:
-                pass
-        # 2) Auto-generierte in bevorzugter Sprache
-        for lang in prefer_langs:
-            try:
-                tr = tl.find_manually_created_transcript([lang])  # if exists, we already tried; continue
-            except Exception:
-                pass
-            try:
-                # auto transcript (might need translate if source differs)
-                # try any transcript then translate
-                for tr in tl:
-                    try:
-                        tr2 = tr.translate(lang)
-                        chunks = tr2.fetch()
-                        txt = " ".join(c["text"] for c in chunks if c.get("text")).strip()
-                        if txt:
-                            return txt
-                    except Exception:
-                        continue
-            except Exception:
-                pass
-        # 3) Fallback: nimm irgendein verfügbares Transcript
-        try:
-            any_tr = next(iter(tl))
-            chunks = any_tr.fetch()
-            txt = " ".join(c["text"] for c in chunks if c.get("text")).strip()
-            return txt or None
-        except Exception:
-            return None
+                chunks = yt.fetch(video_id, languages=langs)
+                text = " ".join(c.text for c in chunks).strip()
+                if text:
+                    return text, (langs[0] if isinstance(langs, list) else langs)
+            except NoTranscriptFound:
+                continue
+        return None, None
     except (TranscriptsDisabled, NoTranscriptFound):
-        return None
+        return None, None
     except Exception:
-        return None
+        return None, None
 
-def url_key(url: str) -> str:
-    return hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
-
-def paths_for(url: str):
-    key = url_key(url)
-    tmp = "/tmp"
-    raw = os.path.join(tmp, f"raw_{key}.m4a")
-    wav = os.path.join(tmp, f"audio_{key}.wav")  # 16k/mono
-    return key, raw, wav
-
-def download_audio(youtube_url: str, raw_out: str):
-    # B: Nur wenn keine Captions: yt-dlp versuchen
-    from yt_dlp import YoutubeDL
-    ydl_opts = {
-        "format": "bestaudio/best",
-        "outtmpl": raw_out,
-        "quiet": True,
-        "geo_bypass": True,
-        "nocheckcertificate": True,
-        # "extractor_args": {"youtube": {"player_client": ["android","web"]}},  # optional
-    }
-    with YoutubeDL(ydl_opts) as ydl:
-        ydl.download([youtube_url])
-
-def to_wav_16k_mono(inp: str, outp: str):
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", inp, "-ac", "1", "-ar", "16000", outp],
-        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+async def openai_facts(text: str, lang_hint: str = "de"):
+    import json as _json
+    system = (
+        "Du bist ein Faktenprüf-Assistent. "
+        "Extrahiere NUR objektiv überprüfbare Aussagen (Zahlen/Daten/Fakten). "
+        "Bewerte jede Aussage als 'richtig' | 'falsch' | 'unklar'. "
+        "Gib pro Eintrag 1–3 glaubwürdige Quellen-URLs an. "
+        "Keine Erklärsätze außerhalb der verlangten JSON-Struktur."
     )
+    clipped = text[:12000]
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": f"Sprache: {lang_hint}\nTranskript:\n{clipped}"}
+    ]
 
-async def deepgram_transcribe(wav_path: str) -> str:
-    """C: Deepgram-Fallback – gibt reinen Text zurück."""
-    headers = {"Authorization": f"Token {DG_KEY}"}
-    params = {
-        "punctuate": "true",
-        "smart_format": "true",
-        "detect_language": "true",
+    schema = {
+    "name": "facts_response",
+    "schema": {
+        "type": "object",
+        "properties": {
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["claim", "verdict", "sources"],
+                    "properties": {
+                        "claim":   {"type": "string"},
+                        "verdict": {"type": "string", "enum": ["richtig", "falsch", "unklar"]},
+                        "sources": {
+                            "type": "array",
+                            "items": {
+                                "type": "string",
+                                # statt "format": "uri" -> Regex:
+                                "pattern": "^https?://\\S+$"
+                            },
+                            "minItems": 0,
+                            "maxItems": 3
+                        }
+                    },
+                    "additionalProperties": False
+                }
+            }
+        },
+        "required": ["items"],
+        "additionalProperties": False
+    },
+    "strict": True
+}
+
+
+    headers = {"Authorization": f"Bearer {OPENAI_KEY}", "Content-Type": "application/json"}
+    body = {
+        "model": "gpt-4o-mini",   # Fallback: "gpt-4o" oder "gpt-4o-mini"
+        "temperature": 0.1,
+        "messages": messages,
+        # -> Erzwinge wohlgeformtes JSON nach Schema:
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": schema
+        },
+        "max_tokens": 800
     }
-    async with httpx.AsyncClient(timeout=300) as cx:
-        with open(wav_path, "rb") as f:
-            r = await cx.post(
-                "https://api.deepgram.com/v1/listen",
-                headers=headers, params=params, content=f.read()
-            )
-    r.raise_for_status()
+
+    async with httpx.AsyncClient(timeout=120) as cx:
+        r = await cx.post("https://api.openai.com/v1/chat/completions", headers=headers, json=body)
+    if r.status_code >= 400:
+        raise RuntimeError(f"OpenAI error {r.status_code}: {r.text}")
+
     data = r.json()
-    alt = (
-        data.get("results", {})
-            .get("channels", [{}])[0]
-            .get("alternatives", [{}])[0]
-    )
-    transcript = alt.get("transcript") or ""
-    if not transcript:
-        paras = alt.get("paragraphs", {}).get("paragraphs", [])
-        transcript = " ".join(p.get("text","") for p in paras if p.get("text"))
-    return (transcript or "").strip()
+    content = data["choices"][0]["message"]["content"]
 
-# ---------- Serve WAV if we used fallback ----------
-@server.route("/audio/<key>.wav")
-def serve_audio(key):
-    wav = os.path.join("/tmp", f"audio_{key}.wav")
-    if not os.path.exists(wav):
-        return ("Not found", 404)
-    return send_file(wav, mimetype="audio/wav", as_attachment=False)
+    # Jetzt sollte content garantiert ein JSON-Objekt mit 'items' sein:
+    try:
+        parsed = _json.loads(content)
+    except Exception as e:
+        # Wenn es trotz Schema schief geht, gib die Rohantwort zurück zur Diagnose
+        raise RuntimeError(f"JSON-Parsing fehlgeschlagen: {e}\nAntwort: {content[:500]}")
+
+    items = parsed.get("items", [])
+    # Sicherheitsnetz: Liste von Dicts erzwingen
+    norm = []
+    for x in items:
+        if isinstance(x, dict):
+            claim = x.get("claim", "")
+            verdict = x.get("verdict", "")
+            sources = x.get("sources", [])
+            if isinstance(sources, list):
+                norm.append({"claim": claim, "verdict": verdict, "sources": sources})
+        elif isinstance(x, str):
+            norm.append({"claim": x, "verdict": "unklar", "sources": []})
+    return norm
+
 
 # ---------- UI ----------
 app.layout = html.Div(
-    style={"maxWidth": 780, "margin": "40px auto", "fontFamily": "system-ui, Arial"},
+    style={"maxWidth": 900, "margin": "40px auto", "fontFamily": "system-ui, Arial"},
     children=[
-        html.H2("Schritt 3 – Captions‑First → Fallback Deepgram"),
         html.Div(
             style={"display": "flex", "gap": "10px", "alignItems": "center"},
             children=[
@@ -184,106 +186,87 @@ app.layout = html.Div(
                     style={"flex": 1, "padding": "12px", "borderRadius": "10px", "border": "1px solid #ccc"},
                 ),
                 html.Button(
-                    "Absenden",
-                    id="submit",
+                    "Fakten prüfen",
+                    id="analyze",
                     n_clicks=0,
                     style={"padding": "12px 16px", "border": "none", "borderRadius": "10px",
                            "background": "#2563eb", "color": "white", "fontWeight": 600, "cursor": "pointer"},
                 ),
             ],
         ),
-        html.Div(id="status_url", style={"marginTop": "10px"}),
+        html.Div(id="status", style={"marginTop": "10px", "color": "#555"}),
+        html.Div(id="caption_info", style={"marginTop": "6px", "color": "#0a7f3f"}),
+        html.Div(id="warning_info", style={"marginTop": "6px", "color": "#b06500"}),
         html.Hr(),
-        html.Div(
-            style={"display": "flex", "gap": "10px", "alignItems": "center"},
-            children=[
-                html.Button(
-                    "Transkribieren",
-                    id="transcribe_btn",
-                    n_clicks=0,
-                    style={"padding": "10px 14px", "borderRadius": "8px", "border": "1px solid #ddd", "cursor": "pointer"}
-                ),
-                html.Span(id="transcribe_status", style={"color": "#555"})
+        html.Div(id="transcript_preview", style={"whiteSpace": "pre-wrap", "marginBottom": "16px", "display": "none"}),
+        dash_table.DataTable(
+            id="facts_table",
+            columns=[
+                {"name": "Aussage", "id": "claim"},
+                {"name": "Bewertung", "id": "verdict"},
+                {"name": "Quellen", "id": "sources"},
             ],
+            data=[],
+            style_cell={"whiteSpace": "pre-line", "fontSize": 14},
+            style_table={"overflowX": "auto"},
         ),
-        html.Audio(id="player", src="", controls=True, style={"width": "100%", "marginTop": "8px"}),
-        html.Div(id="transcript_text", style={"marginTop": "16px", "whiteSpace": "pre-wrap"}),
-        dcc.Store(id="video_id_store"),
-        dcc.Store(id="audio_key_store"),
     ],
 )
 
-# ---------- Callbacks ----------
+# ---------- Callback ----------
 @app.callback(
-    Output("status_url", "children"),
-    Output("video_id_store", "data"),
-    Output("audio_key_store", "data"),
-    Input("submit", "n_clicks"),
-    Input("url", "n_submit"),
+    Output("status", "children"),
+    Output("caption_info", "children"),
+    Output("warning_info", "children"),
+    Output("transcript_preview", "children"),
+    Output("transcript_preview", "style"),
+    Output("facts_table", "data"),
+    Input("analyze", "n_clicks"),
     State("url", "value"),
     prevent_initial_call=True,
 )
-def validate_url(n_clicks, n_submit, url):
-    _ = (n_clicks, n_submit)
+def run_pipeline(n_clicks, url):
     if not url or not is_valid_youtube_url(url):
-        return ("❌ Keine gültige YouTube‑URL.", None, None)
+        return ("❌ Keine gültige YouTube‑URL.", "", "", "", {"display": "none"}, [])
+
+    if not OPENAI_KEY:
+        return ("⚠️ OPENAI_API_KEY fehlt.", "", "", "", {"display": "none"}, [])
+
     vid = get_video_id(url)
-    key, raw, wav = paths_for(url)
-    # Wir EXTRAHIEREN NOCH NICHT — erst, wenn Captions fehlen
-    return ("✅ Gültige YouTube‑URL.", {"video_id": vid, "url": url}, {"key": key, "url": url})
+    if not vid:
+        return ("❌ Konnte Video‑ID nicht ermitteln.", "", "", "", {"display": "none"}, [])
 
-@app.callback(
-    Output("transcribe_status", "children"),
-    Output("transcript_text", "children"),
-    Output("player", "src"),
-    Input("transcribe_btn", "n_clicks"),
-    State("video_id_store", "data"),
-    State("audio_key_store", "data"),
-    prevent_initial_call=True,
-)
-def transcribe_flow(n, vid_data, key_data):
-    if not vid_data or not key_data:
-        return ("Bitte zuerst URL prüfen.", "", "")
+    # 1) Captions-only
+    text, lang = fetch_captions_simple(vid)
+    if not text:
+        # MVP: kein Fallback auf Audio; klare Meldung:
+        warn = "Für dieses Video sind keine Untertitel verfügbar. Bitte anderes Video probieren."
+        return ("", "", warn, "", {"display": "none"}, [])
 
-    video_id = vid_data.get("video_id")
-    url = vid_data.get("url")
-    key = key_data.get("key")
-    raw, wav = paths_for(url)[1:]
-
-    # A) Captions-First
-    caps = None
-    try:
-        caps = fetch_youtube_captions(video_id, ("de","en"))
-    except Exception:
-        caps = None
-
-    if caps:
-        # Bypass Audio – direkt Captions anzeigen
-        return ("Untertitel gefunden (Quelle: YouTube).", caps, "")
-
-    # B) Kein Caption → Audio extrahieren (yt-dlp)
-    try:
-        if not os.path.exists(raw):
-            download_audio(url, raw)
-        if not os.path.exists(wav):
-            to_wav_16k_mono(raw, wav)
-    except Exception as e:
-        msg = str(e)
-        if "Sign in to confirm you’re not a bot" in msg or "confirm you're not a bot" in msg:
-            return ("Dieses Video blockiert automatisches Abrufen. Bitte anderes Video testen.", "", "")
-        return (f"Extraktion fehlgeschlagen: {e}", "", "")
-
-    # C) Deepgram-Transkription
-    if not DG_KEY:
-        return ("Deepgram-Key fehlt – kann nicht transkribieren.", "", f"/audio/{key}.wav")
+    # 2) LLM
     try:
         import asyncio
-        text = asyncio.run(deepgram_transcribe(wav))
-        return ("Transkription (Deepgram) fertig.", text or "(leer)", f"/audio/{key}.wav")
+        results = asyncio.run(openai_facts(text, lang_hint=lang or "de"))
     except Exception as e:
-        return (f"Transkription fehlgeschlagen: {e}", "", f"/audio/{key}.wav")
+        return (f"LLM-Fehler: {e}", "", "", "", {"display": "none"}, [])
 
-# optional Healthcheck
+    # 3) Tabelle
+    rows = []
+    for item in results:
+        claim = item.get("claim", "")
+        verdict = item.get("verdict", "")
+        sources = item.get("sources", [])
+        src_str = "\n".join(sources) if isinstance(sources, list) else str(sources)
+        rows.append({"claim": claim, "verdict": verdict, "sources": src_str})
+
+
+    # Optional: kurzes Preview vom Transkript (ausblenden im MVP)
+    preview = text[:1000] + ("…" if len(text) > 1000 else "")
+    cap_info = f"Untertitel gefunden (Quelle: YouTube, Sprache: {lang})."
+    status = "Faktenprüfung abgeschlossen."
+    return (status, cap_info, "", preview, {"display": "none"}, rows)
+
+# Healthcheck (Render)
 @server.route("/healthz")
 def healthz():
     return "ok", 200
