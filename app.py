@@ -106,8 +106,13 @@ def build_ytt_api(video_id: str) -> YouTubeTranscriptApi:
         session_suffix = video_id[-6:] if video_id else "s1"
         username = f"{YTT_PROXY_USERNAME}-session-{session_suffix}"
         proxy_url = f"http://{username}:{YTT_PROXY_PASSWORD}@p.webshare.io:80"
-        proxy_cfg = ProxyConfig(http=proxy_url, https=proxy_url)
+
+        proxy_cfg = ProxyConfig()
+        proxy_cfg.http = proxy_url
+        proxy_cfg.https = proxy_url
+
         return YouTubeTranscriptApi(proxy_config=proxy_cfg, user_agent=YT_USER_AGENT)
+
     # Kein Proxy, direkter Zugriff (häufig ausreichend)
     return YouTubeTranscriptApi(user_agent=YT_USER_AGENT)
 
