@@ -5,10 +5,17 @@ import json
 import httpx
 from dash import Dash, html, dcc, dash_table, Input, Output, State
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
+from youtube_transcript_api.proxies import WebshareProxyConfig
 
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_KEY:
     print("WARN: OPENAI_API_KEY fehlt – die Faktenprüfung wird fehlschlagen.")
+YTT_PROXY_USERNAME = os.getenv("YTT_PROXY_USERNAME")
+if not OPENAI_KEY:
+    print("WARN: YTT_PROXY_USERNAME fehlt – die Faktenprüfung wird fehlschlagen.")
+YTT_PROXY_PASSWORD = os.getenv("YTT_PROXY_PASSWORD")
+if not YTT_PROXY_PASSWORD:
+    print("WARN: YTT_PROXY_PASSWORD fehlt – die Faktenprüfung wird fehlschlagen.")
 
 app = Dash(__name__)
 server = app.server #render
@@ -60,11 +67,16 @@ def fetch_captions_simple(video_id: str):
     Holt das YouTube-Transcript (ohne Audio), bevorzugt DE, dann EN.
     Rückgabe: (text, lang) oder (None, None)
     """
-    yt = YouTubeTranscriptApi()
+    ytt_api = YouTubeTranscriptApi(
+    proxy_config=WebshareProxyConfig(
+        proxy_username=YTT_PROXY_USERNAME,
+        proxy_password=YTT_PROXY_PASSWORD,
+        )
+    )
     try:
         for langs in (['de'], ['en'], ['de','en'], ['en','de']):
             try:
-                chunks = yt.fetch(video_id, languages=langs)
+                chunks = ytt_api.fetch(video_id, languages=langs)
                 text = " ".join(c.text for c in chunks).strip()
                 if text:
                     return text, (langs[0] if isinstance(langs, list) else langs)
