@@ -1,26 +1,40 @@
 import os
+import json
+import time
+import random
+import threading
 from urllib.parse import urlparse, parse_qs
 
-import json
 import httpx
 from dash import Dash, html, dcc, dash_table, Input, Output, State
+from flask import jsonify
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
-from youtube_transcript_api.proxies import WebshareProxyConfig
+from youtube_transcript_api._api import ProxyConfig  # nur hier für YT nutzen
 
-OPENAI_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_KEY:
-    print("WARN: OPENAI_API_KEY fehlt – die Faktenprüfung wird fehlschlagen.")
-YTT_PROXY_USERNAME = os.getenv("YTT_PROXY_USERNAME")
-if not OPENAI_KEY:
-    print("WARN: YTT_PROXY_USERNAME fehlt – die Faktenprüfung wird fehlschlagen.")
-YTT_PROXY_PASSWORD = os.getenv("YTT_PROXY_PASSWORD")
-if not YTT_PROXY_PASSWORD:
-    print("WARN: YTT_PROXY_PASSWORD fehlt – die Faktenprüfung wird fehlschlagen.")
+# =========================
+# Konfiguration / Globals
+# =========================
+OPENAI_KEY = os.getenv("OPENAI_API_KEY")  # <--- NIEMALS hardcoden
+YTT_PROXY_USERNAME = os.getenv("YTT_PROXY_USERNAME", "").strip()
+YTT_PROXY_PASSWORD = os.getenv("YTT_PROXY_PASSWORD", "").strip()
 
-app = Dash(__name__)
-server = app.server #render
+# Serialisierung: Ein Job zur Zeit (verhindert parallele Transkript-Fetches)
+FACTCHECK_LOCK = threading.Lock()
 
-# ---------- Utils ----------
+# Cache-Verzeichnis (persistiert pro Kaltstart; auf Render /tmp möglich)
+CACHE_DIR = "/tmp/yt_caps_cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+# Realistischer User-Agent nur für YT
+YT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
+# =========================
+# Utilities
+# =========================
 def is_valid_youtube_url(url: str) -> bool:
     if not url:
         return False
@@ -62,45 +76,100 @@ def get_video_id(url: str) -> str | None:
         return path.split("/")[2]
     return None
 
-def fetch_captions_simple(video_id: str):
-    """
-    Holt das YouTube-Transcript (ohne Audio), bevorzugt DE, dann EN.
-    Rückgabe: (text, lang) oder (None, None)
-    """
-    ytt_api = YouTubeTranscriptApi(
-    proxy_config=WebshareProxyConfig(
-        proxy_username=YTT_PROXY_USERNAME,
-        proxy_password=YTT_PROXY_PASSWORD,
-        )
-    )
-    try:
-        for langs in (['de'], ['en'], ['de','en'], ['en','de']):
-            try:
-                chunks = ytt_api.fetch(video_id, languages=langs)
-                text = " ".join(c.text for c in chunks).strip()
-                if text:
-                    return text, (langs[0] if isinstance(langs, list) else langs)
-            except NoTranscriptFound as e:
-                print(e)
-                continue
-        return None, None
-    except (TranscriptsDisabled, NoTranscriptFound) as e:
-        print(e)
-        return None, None
-    except Exception as e:
-        print(e)
-        return None, None
+def cache_path(video_id: str) -> str:
+    return os.path.join(CACHE_DIR, f"{video_id}.json")
 
-async def openai_facts(text: str, lang_hint: str = "de"):
-    import json as _json
+def get_cached_transcript(video_id: str):
+    fp = cache_path(video_id)
+    if os.path.exists(fp):
+        try:
+            with open(fp, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data.get("text"), data.get("lang")
+        except Exception:
+            return None, None
+    return None, None
+
+def set_cached_transcript(video_id: str, text: str, lang: str | None):
+    try:
+        with open(cache_path(video_id), "w", encoding="utf-8") as f:
+            json.dump({"text": text, "lang": lang}, f)
+    except Exception:
+        pass
+
+def build_ytt_api(video_id: str) -> YouTubeTranscriptApi:
+    """
+    Proxy NUR für YT nutzen. Sticky Session optional durch Username-Variation.
+    """
+    if YTT_PROXY_USERNAME and YTT_PROXY_PASSWORD:
+        # Session leicht variieren, aber stabil pro Video (minimiert Flagging)
+        session_suffix = video_id[-6:] if video_id else "s1"
+        username = f"{YTT_PROXY_USERNAME}-session-{session_suffix}"
+        proxy_url = f"http://{username}:{YTT_PROXY_PASSWORD}@p.webshare.io:80"
+        proxy_cfg = ProxyConfig(http=proxy_url, https=proxy_url)
+        return YouTubeTranscriptApi(proxy_config=proxy_cfg, user_agent=YT_USER_AGENT)
+    # Kein Proxy, direkter Zugriff (häufig ausreichend)
+    return YouTubeTranscriptApi(user_agent=YT_USER_AGENT)
+
+def fetch_captions_once(ytt: YouTubeTranscriptApi, video_id: str):
+    """
+    EIN Versuch, EIN Request: eine Sprachliste ['de','en'].
+    """
+    chunks = ytt.get_transcript(video_id, languages=['de', 'en'])
+    text = " ".join(c["text"] for c in chunks if c.get("text")).strip()
+    return (text or None), None  # Sprache ist hier nicht sicher bestimmbar
+
+def fetch_with_retry(video_id: str, max_tries: int = 2, base_delay: float = 1.0):
+    """
+    Streng seriell, kleine Retries mit Jitter.
+    """
+    ytt = build_ytt_api(video_id)
+    last_err = None
+    for attempt in range(1, max_tries + 1):
+        try:
+            text, lang = fetch_captions_once(ytt, video_id)
+            if text:
+                return text, (lang or "de/en")
+            # Keine Transkripte vorhanden -> kein weiterer Retry nötig
+            return None, None
+        except (NoTranscriptFound, TranscriptsDisabled):
+            return None, None
+        except Exception as e:
+            last_err = e
+            if attempt < max_tries:
+                delay = base_delay * (2 ** (attempt - 1)) * random.uniform(0.9, 1.2)
+                time.sleep(min(delay, 6.0))
+                continue
+    # nach max_tries gescheitert
+    raise RuntimeError(f"Transcript fetch failed after {max_tries} tries. Last error: {last_err}")
+
+def normalize_urls(urls: list[str]) -> list[str]:
+    out = []
+    for u in urls or []:
+        u = (u or "").strip()
+        u = u.rstrip(".,;:)]}›’”\"'")
+        if u.startswith("www."):
+            u = "https://" + u
+        out.append(u)
+    return out
+
+# =========================
+# OpenAI – synchron, ohne Proxy
+# =========================
+def openai_facts(text: str, lang_hint: str = "de"):
+    """
+    Synchronously call OpenAI (structured outputs, robust JSON).
+    """
+    if not OPENAI_KEY:
+        raise RuntimeError("OPENAI_API_KEY fehlt.")
+
     system = (
         "Du bist ein Faktenprüf-Assistent. "
         "Extrahiere NUR objektiv überprüfbare Aussagen (Zahlen/Daten/Fakten). "
         "Bewerte jede Aussage als 'richtig' | 'falsch' | 'unklar'. "
-        "Gib pro Eintrag 1–3 GLAUBWÜRDIGE QUELLEN als **vollständige, direkte URLs mit Protokoll** an "
-        "(z.B. https://bundesregierung.de/...; **keine** Startseiten wie https://bmwi.de, "
-        "**keine** URL-Kürzer, **keine** Platzhalter). "
-        "Wenn du keine spezifische Quelle nennen kannst, setze verdict='unklar' und sources=[]. "
+        "Gib pro Eintrag 1–3 GLAUBWÜRDIGE QUELLEN als vollständige, direkte URLs mit Protokoll an "
+        "(z.B. https://bundesregierung.de/...; keine Startseiten, keine Kurz-URLs, keine Platzhalter). "
+        "Wenn keine spezifische Quelle sicher ist, setze verdict='unklar' und sources=[]. "
         "Keine Erklärsätze außerhalb der JSON-Struktur."
     )
 
@@ -127,7 +196,6 @@ async def openai_facts(text: str, lang_hint: str = "de"):
                                 "type": "array",
                                 "items": {
                                     "type": "string",
-                                    # http(s) + keine Leerzeichen; Klammer-Schlusszeichen am Ende vermeiden
                                     "pattern": "^https?://[^\\s)\\]}]+$"
                                 },
                                 "minItems": 0,
@@ -144,53 +212,43 @@ async def openai_facts(text: str, lang_hint: str = "de"):
         "strict": True
     }
 
-    headers = {"Authorization": f"Bearer {OPENAI_KEY}", "Content-Type": "application/json"}
     body = {
-        "model": "gpt-4o-mini",   # Fallback: "gpt-4o" oder "gpt-4o-mini"
+        "model": "gpt-4o-mini",  # Structured Outputs fähig und günstig
         "temperature": 0.1,
         "messages": messages,
-        # -> Erzwinge wohlgeformtes JSON nach Schema:
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": schema
-        },
-        "max_tokens": 800
+        "response_format": {"type": "json_schema", "json_schema": schema},
+        "max_tokens": 800,
     }
 
-    async with httpx.AsyncClient(timeout=120) as cx:
-        r = await cx.post("https://api.openai.com/v1/chat/completions", headers=headers, json=body)
+    headers = {"Authorization": f"Bearer {OPENAI_KEY}", "Content-Type": "application/json"}
+    with httpx.Client(timeout=120) as cx:  # kein Proxy!
+        r = cx.post("https://api.openai.com/v1/chat/completions", headers=headers, json=body)
     if r.status_code >= 400:
         raise RuntimeError(f"OpenAI error {r.status_code}: {r.text}")
 
-    data = r.json()
-    content = data["choices"][0]["message"]["content"]
-
-    # Jetzt sollte content garantiert ein JSON-Objekt mit 'items' sein:
-    try:
-        parsed = _json.loads(content)
-    except Exception as e:
-        # Wenn es trotz Schema schief geht, gib die Rohantwort zurück zur Diagnose
-        raise RuntimeError(f"JSON-Parsing fehlgeschlagen: {e}\nAntwort: {content[:500]}")
-
+    content = r.json()["choices"][0]["message"]["content"]
+    parsed = json.loads(content)  # dank Schema: valides JSON-Objekt
     items = parsed.get("items", [])
-    # Sicherheitsnetz: Liste von Dicts erzwingen
-    norm = []
+
+    # Normalize
+    out = []
     for x in items:
-        if isinstance(x, dict):
-            claim = x.get("claim", "")
-            verdict = x.get("verdict", "")
-            sources = x.get("sources", [])
-            if isinstance(sources, list):
-                norm.append({"claim": claim, "verdict": verdict, "sources": sources})
-        elif isinstance(x, str):
-            norm.append({"claim": x, "verdict": "unklar", "sources": []})
-    return norm
+        claim = x.get("claim", "")
+        verdict = x.get("verdict", "")
+        sources = normalize_urls(x.get("sources", []))
+        out.append({"claim": claim, "verdict": verdict, "sources": sources})
+    return out
 
+# =========================
+# Dash App
+# =========================
+app = Dash(__name__)
+server = app.server
 
-# ---------- UI ----------
 app.layout = html.Div(
     style={"maxWidth": 900, "margin": "40px auto", "fontFamily": "system-ui, Arial"},
     children=[
+        html.H2("YouTube → Faktencheck (MVP: Captions‑only, bot‑sicher)"),
         html.Div(
             style={"display": "flex", "gap": "10px", "alignItems": "center"},
             children=[
@@ -204,6 +262,7 @@ app.layout = html.Div(
                     "Fakten prüfen",
                     id="analyze",
                     n_clicks=0,
+                    disabled=False,  # wird im Callback via Lock „virtuell“ serialisiert
                     style={"padding": "12px 16px", "border": "none", "borderRadius": "10px",
                            "background": "#2563eb", "color": "white", "fontWeight": 600, "cursor": "pointer"},
                 ),
@@ -213,7 +272,6 @@ app.layout = html.Div(
         html.Div(id="caption_info", style={"marginTop": "6px", "color": "#0a7f3f"}),
         html.Div(id="warning_info", style={"marginTop": "6px", "color": "#b06500"}),
         html.Hr(),
-        html.Div(id="transcript_preview", style={"whiteSpace": "pre-wrap", "marginBottom": "16px", "display": "none"}),
         dash_table.DataTable(
             id="facts_table",
             columns=[
@@ -228,64 +286,76 @@ app.layout = html.Div(
     ],
 )
 
-# ---------- Callback ----------
+# =========================
+# Callback
+# =========================
 @app.callback(
     Output("status", "children"),
     Output("caption_info", "children"),
     Output("warning_info", "children"),
-    Output("transcript_preview", "children"),
-    Output("transcript_preview", "style"),
     Output("facts_table", "data"),
     Input("analyze", "n_clicks"),
     State("url", "value"),
     prevent_initial_call=True,
 )
 def run_pipeline(n_clicks, url):
-    if not url or not is_valid_youtube_url(url):
-        return ("❌ Keine gültige YouTube‑URL.", "", "", "", {"display": "none"}, [])
+    # (6) Sofortiger Doppel-Trigger-Schutz & Serialisierung
+    if not FACTCHECK_LOCK.acquire(blocking=False):
+        return ("Bitte warten – ein anderer Auftrag läuft bereits.", "", "", [])
 
-    if not OPENAI_KEY:
-        return ("⚠️ OPENAI_API_KEY fehlt.", "", "", "", {"display": "none"}, [])
-
-    vid = get_video_id(url)
-    if not vid:
-        return ("❌ Konnte Video‑ID nicht ermitteln.", "", "", "", {"display": "none"}, [])
-
-    # 1) Captions-only
-    text, lang = fetch_captions_simple(vid)
-    if not text:
-        # MVP: kein Fallback auf Audio; klare Meldung:
-        warn = "Für dieses Video sind keine Untertitel verfügbar. Bitte anderes Video probieren."
-        return ("", "", warn, "", {"display": "none"}, [])
-
-    # 2) LLM
     try:
-        import asyncio
-        results = asyncio.run(openai_facts(text, lang_hint=lang or "de"))
-    except Exception as e:
-        return (f"LLM-Fehler: {e}", "", "", "", {"display": "none"}, [])
+        # Basic Validierungen
+        if not url or not is_valid_youtube_url(url):
+            return ("❌ Keine gültige YouTube‑URL.", "", "", [])
 
-    # 3) Tabelle
-    rows = []
-    for item in results:
-        claim = item.get("claim", "")
-        verdict = item.get("verdict", "")
-        sources = item.get("sources", [])
-        src_str = "\n".join(sources) if isinstance(sources, list) else str(sources)
-        rows.append({"claim": claim, "verdict": verdict, "sources": src_str})
+        if not OPENAI_KEY:
+            return ("⚠️ OPENAI_API_KEY fehlt.", "", "", [])
 
+        video_id = get_video_id(url)
+        if not video_id:
+            return ("❌ Konnte Video‑ID nicht ermitteln.", "", "", [])
 
-    # Optional: kurzes Preview vom Transkript (ausblenden im MVP)
-    preview = text[:1000] + ("…" if len(text) > 1000 else "")
-    cap_info = f"Untertitel gefunden (Quelle: YouTube, Sprache: {lang})."
-    status = "Faktenprüfung abgeschlossen."
-    return (status, cap_info, "", preview, {"display": "none"}, rows)
+        # (2) Cache prüfen
+        cached_text, cached_lang = get_cached_transcript(video_id)
+        if cached_text:
+            facts = openai_facts(cached_text, lang_hint=cached_lang or "de")
+            return ("Faktenprüfung abgeschlossen (aus Cache).",
+                    f"Untertitel (Cache) – Sprache: {cached_lang or 'de/en'}.",
+                    "",
+                    [{"claim": x["claim"], "verdict": x["verdict"], "sources": "\n".join(x["sources"])} for x in facts])
 
-# Healthcheck (Render)
+        # (4)+(3)+(1) Strenger, bot-sicherer Fetch der Untertitel (seriell, 2 Retries, 1 Sprachliste, Proxy nur für YT)
+        try:
+            text, lang = fetch_with_retry(video_id, max_tries=2, base_delay=1.0)
+        except RuntimeError as e:
+            # Zu viele 429 / Sorry-Pages / Netzfehler
+            return ("", "", "YouTube hat den Abruf gedrosselt. Bitte später erneut versuchen oder anderes Video testen.", [])
+
+        if not text:
+            # Keine Untertitel vorhanden oder deaktiviert
+            return ("", "", "Für dieses Video sind keine Untertitel verfügbar. Bitte anderes Video probieren.", [])
+
+        # (2) Cache setzen
+        set_cached_transcript(video_id, text, lang)
+
+        # LLM‑Faktenprüfung (ohne Proxy)
+        facts = openai_facts(text, lang_hint=lang or "de")
+
+        rows = [{"claim": x["claim"], "verdict": x["verdict"], "sources": "\n".join(x["sources"])} for x in facts]
+        return ("Faktenprüfung abgeschlossen.",
+                f"Untertitel gefunden (Quelle: YouTube, Sprache: {lang}).",
+                "",
+                rows)
+
+    finally:
+        FACTCHECK_LOCK.release()
+
+# Healthcheck
 @server.route("/healthz")
 def healthz():
     return "ok", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8050))
+    # Debug AUS, um doppelte Aufrufe/Reloader zu vermeiden
     app.run(host="0.0.0.0", port=port, debug=False)
