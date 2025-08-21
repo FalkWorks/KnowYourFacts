@@ -68,12 +68,15 @@ def fetch_captions_simple(video_id: str):
                 text = " ".join(c.text for c in chunks).strip()
                 if text:
                     return text, (langs[0] if isinstance(langs, list) else langs)
-            except NoTranscriptFound:
+            except NoTranscriptFound as e:
+                print(e)
                 continue
         return None, None
-    except (TranscriptsDisabled, NoTranscriptFound):
+    except (TranscriptsDisabled, NoTranscriptFound) as e:
+        print(e)
         return None, None
-    except Exception:
+    except Exception as e:
+        print(e)
         return None, None
 
 async def openai_facts(text: str, lang_hint: str = "de"):
