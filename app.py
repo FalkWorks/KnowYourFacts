@@ -251,7 +251,6 @@ server = app.server
 app.layout = html.Div(
     style={"maxWidth": 900, "margin": "40px auto", "fontFamily": "system-ui, Arial"},
     children=[
-        html.H2("YouTube → Faktencheck (MVP: Captions‑only, bot‑sicher)"),
         html.Div(
             style={"display": "flex", "gap": "10px", "alignItems": "center"},
             children=[
