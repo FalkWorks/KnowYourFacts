@@ -106,12 +106,10 @@ def build_ytt_api(video_id: str) -> YouTubeTranscriptApi:
         session_suffix = video_id[-6:] if video_id else "s1"
         username = f"{YTT_PROXY_USERNAME}-session-{session_suffix}"
         proxy_url = f"http://{username}:{YTT_PROXY_PASSWORD}@p.webshare.io:80"
-
         proxy_cfg = WebshareProxyConfig(proxy_username = YTT_PROXY_USERNAME, proxy_password=YTT_PROXY_PASSWORD)
-        proxy_cfg.http = proxy_url
-        proxy_cfg.https = proxy_url
-
         return YouTubeTranscriptApi(proxy_config=proxy_cfg)
+    else:
+        return YouTubeTranscriptApi()
 
 def fetch_captions_once(ytt: YouTubeTranscriptApi, video_id: str):
     """

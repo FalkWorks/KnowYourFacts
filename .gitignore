@@ -3,6 +3,9 @@ __pycache__/
 *.py[cod]
 *.pyo
 
+# tryout scripts
+tryout scripts/
+
 # Virtual environments
 venv/
 env/
