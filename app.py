@@ -9,7 +9,7 @@ import httpx
 from dash import Dash, html, dcc, dash_table, Input, Output, State
 from flask import jsonify
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
-from youtube_transcript_api._api import ProxyConfig  # nur hier für YT nutzen
+from youtube_transcript_api.proxies import WebshareProxyConfig  # nur hier für YT nutzen
 
 # =========================
 # Konfiguration / Globals
@@ -107,21 +107,18 @@ def build_ytt_api(video_id: str) -> YouTubeTranscriptApi:
         username = f"{YTT_PROXY_USERNAME}-session-{session_suffix}"
         proxy_url = f"http://{username}:{YTT_PROXY_PASSWORD}@p.webshare.io:80"
 
-        proxy_cfg = ProxyConfig()
+        proxy_cfg = WebshareProxyConfig(proxy_username = YTT_PROXY_USERNAME, proxy_password=YTT_PROXY_PASSWORD)
         proxy_cfg.http = proxy_url
         proxy_cfg.https = proxy_url
 
-        return YouTubeTranscriptApi(proxy_config=proxy_cfg, user_agent=YT_USER_AGENT)
-
-    # Kein Proxy, direkter Zugriff (häufig ausreichend)
-    return YouTubeTranscriptApi(user_agent=YT_USER_AGENT)
+        return YouTubeTranscriptApi(proxy_config=proxy_cfg)
 
 def fetch_captions_once(ytt: YouTubeTranscriptApi, video_id: str):
     """
     EIN Versuch, EIN Request: eine Sprachliste ['de','en'].
     """
-    chunks = ytt.get_transcript(video_id, languages=['de', 'en'])
-    text = " ".join(c["text"] for c in chunks if c.get("text")).strip()
+    chunks = ytt.fetch(video_id, languages=['de', 'en'])
+    text = " ".join(c.text for c in chunks if c.text).strip()
     return (text or None), None  # Sprache ist hier nicht sicher bestimmbar
 
 def fetch_with_retry(video_id: str, max_tries: int = 2, base_delay: float = 1.0):
@@ -129,7 +126,7 @@ def fetch_with_retry(video_id: str, max_tries: int = 2, base_delay: float = 1.0)
     Streng seriell, kleine Retries mit Jitter.
     """
     ytt = build_ytt_api(video_id)
-    last_err = None
+    last_er = None
     for attempt in range(1, max_tries + 1):
         try:
             text, lang = fetch_captions_once(ytt, video_id)
@@ -146,6 +143,7 @@ def fetch_with_retry(video_id: str, max_tries: int = 2, base_delay: float = 1.0)
                 time.sleep(min(delay, 6.0))
                 continue
     # nach max_tries gescheitert
+    print(f"Transcript fetch failed after {max_tries} tries. Last error: {last_err}")
     raise RuntimeError(f"Transcript fetch failed after {max_tries} tries. Last error: {last_err}")
 
 def normalize_urls(urls: list[str]) -> list[str]:
