@@ -297,10 +297,11 @@ app.layout = html.Div(
     Output("warning_info", "children"),
     Output("facts_table", "data"),
     Input("analyze", "n_clicks"),
+    Input("url", "n_submit"),
     State("url", "value"),
     prevent_initial_call=True,
 )
-def run_pipeline(n_clicks, url):
+def run_pipeline(n_clicks, n_submit, url):
     # (6) Sofortiger Doppel-Trigger-Schutz & Serialisierung
     if not FACTCHECK_LOCK.acquire(blocking=False):
         return ("Bitte warten – ein anderer Auftrag läuft bereits.", "", "", [])
