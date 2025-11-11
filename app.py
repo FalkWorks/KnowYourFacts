@@ -40,12 +40,14 @@ YT_USER_AGENT = (
 
 # Welche Sprachen sollen priorisiert werden?
 SUBTITLE_LANG_PREF = [
-    lang.strip()
+    lang.strip().lower()
     for lang in os.getenv("YOUTUBE_SUBTITLE_LANGS", "de,en").split(",")
     if lang.strip()
 ]
 if not SUBTITLE_LANG_PREF:
     SUBTITLE_LANG_PREF = ["de", "en"]
+SUBTITLE_LANG_PREF = [lang for lang in SUBTITLE_LANG_PREF if lang]
+SUBTITLE_LANG_PREF_SET = set(SUBTITLE_LANG_PREF)
 
 # TTLs für Fehler-Caching
 YOUTUBE_FAILURE_TTL = float(os.getenv("YOUTUBE_FAILURE_TTL", "900"))  # Sekunden
@@ -151,19 +153,90 @@ def _extract_lang_from_filename(path: str) -> str | None:
         return parts[-2]
     return None
 
-def _lang_rank(lang: str | None, preference: list[str]) -> int:
+def _match_language_key(pool: dict, wanted: str) -> str | None:
+    """
+    Sucht zu einer gewünschten Sprache (z.B. 'de') einen konkreten Key (z.B. 'de-DE').
+    """
+    if not pool or not wanted:
+        return None
+    wanted = wanted.lower()
+    for key in pool:
+        if key.lower() == wanted and pool.get(key):
+            return key
+    for key in pool:
+        base = key.split("-")[0].lower()
+        if base == wanted and pool.get(key):
+            return key
+    return None
+
+def _detect_primary_audio_language(info: dict) -> str | None:
+    """
+    Versucht die Hauptsprache des Videos aus den Metadaten zu bestimmen.
+    """
+    for key in (
+        "language",
+        "audio_language",
+        "default_audio_language",
+        "default_language",
+        "original_language",
+    ):
+        value = info.get(key)
+        if value:
+            return value.split("-")[0].lower()
+    return None
+
+def _order_preferences(info: dict, preferred: list[str]) -> list[str]:
+    """
+    Sortiert die Wunschsprachen so, dass die erkannte Hauptsprache ganz vorne steht.
+    """
+    preferred = [
+        lang.lower()
+        for lang in (preferred or SUBTITLE_LANG_PREF)
+        if lang and lang.lower() in SUBTITLE_LANG_PREF_SET
+    ]
+    primary = _detect_primary_audio_language(info)
+    if primary not in SUBTITLE_LANG_PREF_SET:
+        primary = None
+    ordered: list[str] = []
+    if primary:
+        ordered.append(primary)
+    for lang in preferred:
+        if lang not in ordered:
+            ordered.append(lang)
+    if not ordered:
+        ordered = SUBTITLE_LANG_PREF.copy()
+    return ordered
+
+def _rank_caption_candidates(info: dict, preferred_order: list[str]) -> list[tuple[str, str]]:
+    """
+    Liefert eine geordnete Liste (Sprache, Quelle) mit manuellen Untertiteln vor automatischen.
+    """
+    manual = info.get("subtitles") or {}
+    automatic = info.get("automatic_captions") or {}
+    candidates: list[tuple[str, str]] = []
+
+    def add_from_pool(pool: dict, kind: str):
+        seen: set[str] = set()
+        for lang in preferred_order:
+            match = _match_language_key(pool, lang)
+            if match and match not in seen:
+                candidates.append((match, kind))
+                seen.add(match)
+
+    add_from_pool(manual, "manual")
+    add_from_pool(automatic, "auto")
+    return candidates
+
+def _normalize_lang_hint(lang: str | None) -> str | None:
     if not lang:
-        return len(preference) + 1
-    try:
-        return preference.index(lang)
-    except ValueError:
-        return len(preference)
+        return None
+    return lang.split("-")[0].lower()
 
 def fetch_captions_with_ytdlp(video_id: str, languages: list[str] | None = None):
     """
     Lädt Untertitel via yt-dlp ohne Proxy und gibt bereinigten Text zurück.
     """
-    languages = languages or SUBTITLE_LANG_PREF
+    languages = [lang.lower() for lang in languages] if languages else SUBTITLE_LANG_PREF
     url = f"https://www.youtube.com/watch?v={video_id}"
     with tempfile.TemporaryDirectory() as tmp_dir:
         outtmpl = os.path.join(tmp_dir, "%(id)s.%(lang)s.%(ext)s")
@@ -182,7 +255,66 @@ def fetch_captions_with_ytdlp(video_id: str, languages: list[str] | None = None)
 
         try:
             with YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
+                try:
+                    info = ydl.extract_info(url, download=False)
+                except DownloadError as e:
+                    raise TranscriptFetchError(
+                        "Metadaten konnten nicht von YouTube geladen werden."
+                    ) from e
+                except Exception as e:
+                    raise TranscriptFetchError(
+                        "Unerwarteter Fehler beim Abrufen der Videometadaten. Nur Videos mit englischer oder deutscher Sprache können analysiert werden!"
+                    ) from e
+
+                ordered_pref = _order_preferences(info, languages)
+                candidates = _rank_caption_candidates(info, ordered_pref)
+                if not candidates:
+                    raise TranscriptUnavailableError(
+                        "Keine passenden Untertitelsprachen wurden von YouTube gemeldet."
+                    )
+
+                last_error: Exception | None = None
+                for target_lang, source_type in candidates:
+                    ydl.params["subtitleslangs"] = [target_lang]
+                    ydl.params["writesubtitles"] = source_type == "manual"
+                    ydl.params["writeautomaticsub"] = source_type != "manual"
+                    try:
+                        ydl.download([url])
+                    except DownloadError as e:
+                        last_error = e
+                        continue
+                    except Exception as e:
+                        last_error = e
+                        continue
+
+                    pattern = os.path.join(tmp_dir, f"{video_id}.{target_lang}*.vtt")
+                    files = sorted(glob.glob(pattern))
+                    if not files:
+                        last_error = FileNotFoundError(
+                            f"Keine Untertiteldatei für Sprache '{target_lang}' gefunden."
+                        )
+                        continue
+
+                    for file_path in files:
+                        try:
+                            with open(file_path, "r", encoding="utf-8") as fh:
+                                raw_vtt = fh.read()
+                        except OSError:
+                            continue
+
+                        cleaned = vtt_to_text(raw_vtt)
+                        if cleaned:
+                            lang_hint = _normalize_lang_hint(target_lang)
+                            return cleaned, lang_hint
+                    last_error = TranscriptUnavailableError(
+                        f"Die Untertiteldatei für '{target_lang}' enthielt keinen Text."
+                    )
+
+                if last_error:
+                    raise TranscriptFetchError(
+                        f"Untertitel konnten nicht geladen werden. Letzter Fehler: {last_error}"
+                    ) from last_error
+                raise TranscriptFetchError("Untertitel konnten nicht geladen werden.")
         except DownloadError as e:
             raise TranscriptFetchError(
                 "Untertitel konnten nicht von YouTube geladen werden."
@@ -192,28 +324,8 @@ def fetch_captions_with_ytdlp(video_id: str, languages: list[str] | None = None)
                 "Unerwarteter Fehler beim Laden der Untertitel."
             ) from e
 
-        pattern = os.path.join(tmp_dir, f"{video_id}*.vtt")
-        files = sorted(glob.glob(pattern))
-        if not files:
-            raise TranscriptUnavailableError(
-                "Für dieses Video sind keine Untertitel verfügbar."
-            )
-
-        files.sort(key=lambda p: (_lang_rank(_extract_lang_from_filename(p), languages), p))
-        for file_path in files:
-            try:
-                with open(file_path, "r", encoding="utf-8") as fh:
-                    raw_vtt = fh.read()
-            except OSError as e:
-                continue
-
-            cleaned = vtt_to_text(raw_vtt)
-            if cleaned:
-                lang = _extract_lang_from_filename(file_path) or (languages[0] if languages else None)
-                return cleaned, lang
-
         raise TranscriptUnavailableError(
-            "Die geladenen Untertiteldateien enthielten keinen Text."
+            "Für dieses Video sind keine Untertitel verfügbar."
         )
 
 def normalize_urls(urls: list[str]) -> list[str]:
@@ -225,6 +337,15 @@ def normalize_urls(urls: list[str]) -> list[str]:
             u = "https://" + u
         out.append(u)
     return out
+
+def format_sources_markdown(urls: list[str]) -> str:
+    urls = [u for u in urls or [] if u]
+    if not urls:
+        return ""
+    parts = []
+    for url in urls:
+        parts.append(f"[{url}]({url})")
+    return "\n".join(parts)
 
 # =========================
 # OpenAI – synchron, ohne Proxy
@@ -241,6 +362,7 @@ def openai_facts(text: str, lang_hint: str = "de"):
         "Extrahiere NUR objektiv überprüfbare Aussagen (Zahlen/Daten/Fakten). "
         "Bewerte jede Aussage als 'richtig' | 'falsch' | 'unklar'. "
         "Gib pro Eintrag 1–3 GLAUBWÜRDIGE QUELLEN als vollständige, direkte URLs mit Protokoll an "
+        "Gib für falsche Aussagen Quellen an, welche das eindeutig widerlegen"
         "(z.B. https://bundesregierung.de/...; keine Startseiten, keine Kurz-URLs, keine Platzhalter). "
         "Wenn keine spezifische Quelle sicher ist, setze verdict='unklar' und sources=[]. "
         "Keine Erklärsätze außerhalb der JSON-Struktur."
@@ -364,9 +486,10 @@ app.layout = html.Div(
                     columns=[
                         {"name": "Aussage", "id": "claim"},
                         {"name": "Bewertung", "id": "verdict"},
-                        {"name": "Quellen", "id": "sources"},
+                        {"name": "Quellen", "id": "sources", "presentation": "markdown"},
                     ],
                     data=[],
+                    markdown_options={"link_target": "_blank"},
                     style_cell={"whiteSpace": "pre-line", "fontSize": 14},
                     style_table={"overflowX": "auto"},
                 ),
@@ -415,7 +538,7 @@ def run_pipeline(n_clicks, n_submit, url):
                     f"Untertitel (Cache) – Sprache: {cached_lang or 'de/en'}.",
                     "",
                     "",
-                    [{"claim": x["claim"], "verdict": x["verdict"], "sources": "\n".join(x["sources"])} for x in facts])
+                    [{"claim": x["claim"], "verdict": x["verdict"], "sources": format_sources_markdown(x["sources"])} for x in facts])
 
         recent_failure = get_recent_transcript_failure(video_id)
         if recent_failure:
@@ -444,7 +567,14 @@ def run_pipeline(n_clicks, n_submit, url):
         # LLM‑Faktenprüfung (ohne Proxy)
         facts = openai_facts(text, lang_hint=lang or "de")
 
-        rows = [{"claim": x["claim"], "verdict": x["verdict"], "sources": "\n".join(x["sources"])} for x in facts]
+        rows = [
+            {
+                "claim": x["claim"],
+                "verdict": x["verdict"],
+                "sources": format_sources_markdown(x["sources"]),
+            }
+            for x in facts
+        ]
         return ("Faktenprüfung abgeschlossen.",
                 f"Untertitel gefunden (Quelle: YouTube, Sprache: {lang or 'de/en'}).",
                 "",
