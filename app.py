@@ -6,10 +6,20 @@ import threading
 from urllib.parse import urlparse, parse_qs
 
 import httpx
+import requests
 from dash import Dash, html, dcc, dash_table, Input, Output, State
 from flask import jsonify
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
+from youtube_transcript_api import (
+    YouTubeTranscriptApi,
+    TranscriptsDisabled,
+    NoTranscriptFound,
+)
+from youtube_transcript_api._errors import IpBlocked, RequestBlocked, YouTubeRequestFailed
 from youtube_transcript_api.proxies import WebshareProxyConfig  # nur hier für YT nutzen
+class RateLimitError(RuntimeError):
+    """Spezifische Ausnahme, wenn YouTube zu viele Requests ablehnt."""
+
 
 # =========================
 # Konfiguration / Globals
@@ -31,6 +41,16 @@ YT_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
+
+# Rate-Limit-Parameter – konservativ wählen, um 429-Antworten zu vermeiden
+YOUTUBE_MIN_FETCH_INTERVAL = float(os.getenv("YOUTUBE_MIN_FETCH_INTERVAL", "4.5"))
+YOUTUBE_FAILURE_TTL = float(os.getenv("YOUTUBE_FAILURE_TTL", "900"))  # Sekunden
+YOUTUBE_TRANSCRIPT_MISS_TTL = float(
+    os.getenv("YOUTUBE_TRANSCRIPT_MISS_TTL", "1800")
+)
+YOUTUBE_RATE_LIMIT_LOCK = threading.Lock()
+LAST_YT_REQUEST_AT = 0.0
+FAILED_TRANSCRIPT_CACHE: dict[str, dict[str, float | str]] = {}
 
 # =========================
 # Utilities
@@ -97,19 +117,61 @@ def set_cached_transcript(video_id: str, text: str, lang: str | None):
     except Exception:
         pass
 
+def mark_transcript_failure(video_id: str, message: str, ttl: float | None = None):
+    expires_at = time.time() + (ttl if ttl is not None else YOUTUBE_FAILURE_TTL)
+    FAILED_TRANSCRIPT_CACHE[video_id] = {"expires": expires_at, "message": message}
+def clear_transcript_failure(video_id: str):
+    FAILED_TRANSCRIPT_CACHE.pop(video_id, None)
+def get_recent_transcript_failure(video_id: str) -> str | None:
+    data = FAILED_TRANSCRIPT_CACHE.get(video_id)
+    if not data:
+        return None
+    expires = float(data.get("expires", 0))
+    if time.time() > expires:
+        FAILED_TRANSCRIPT_CACHE.pop(video_id, None)
+        return None
+    return str(data.get("message", ""))
+
 def build_ytt_api(video_id: str) -> YouTubeTranscriptApi:
     """
     Proxy NUR für YT nutzen. Sticky Session optional durch Username-Variation.
     """
+    session = requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": YT_USER_AGENT,
+            "Accept": "text/html,application/json;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+    )
+    proxy_cfg = None
     if YTT_PROXY_USERNAME and YTT_PROXY_PASSWORD:
         # Session leicht variieren, aber stabil pro Video (minimiert Flagging)
         session_suffix = video_id[-6:] if video_id else "s1"
-        username = f"{YTT_PROXY_USERNAME}-session-{session_suffix}"
-        proxy_url = f"http://{username}:{YTT_PROXY_PASSWORD}@p.webshare.io:80"
-        proxy_cfg = WebshareProxyConfig(proxy_username = YTT_PROXY_USERNAME, proxy_password=YTT_PROXY_PASSWORD)
-        return YouTubeTranscriptApi(proxy_config=proxy_cfg)
-    else:
-        return YouTubeTranscriptApi()
+        proxy_username = YTT_PROXY_USERNAME
+        if "-session-" not in proxy_username:
+            proxy_username = f"{proxy_username}-session-{session_suffix}"
+        proxy_cfg = WebshareProxyConfig(
+            proxy_username=proxy_username,
+            proxy_password=YTT_PROXY_PASSWORD,
+        )
+    return YouTubeTranscriptApi(proxy_config=proxy_cfg, http_client=session)
+
+def wait_for_youtube_slot(attempt: int) -> None:
+    """Wartet optional, um Mindestabstand & Jitter sicherzustellen."""
+    with YOUTUBE_RATE_LIMIT_LOCK:
+        now = time.monotonic()
+        wait_for = LAST_YT_REQUEST_AT + YOUTUBE_MIN_FETCH_INTERVAL - now
+    base_wait = max(0.0, wait_for)
+    jitter_base = YOUTUBE_MIN_FETCH_INTERVAL * (0.15 if attempt == 1 else 0.6)
+    jitter = random.uniform(jitter_base * 0.5, jitter_base * 1.1)
+    sleep_for = base_wait + jitter
+    if sleep_for > 0:
+        time.sleep(sleep_for)
+def mark_youtube_request() -> None:
+    global LAST_YT_REQUEST_AT
+    with YOUTUBE_RATE_LIMIT_LOCK:
+        LAST_YT_REQUEST_AT = time.monotonic()
 
 def fetch_captions_once(ytt: YouTubeTranscriptApi, video_id: str):
     """
@@ -119,30 +181,52 @@ def fetch_captions_once(ytt: YouTubeTranscriptApi, video_id: str):
     text = " ".join(c.text for c in chunks if c.text).strip()
     return (text or None), None  # Sprache ist hier nicht sicher bestimmbar
 
-def fetch_with_retry(video_id: str, max_tries: int = 2, base_delay: float = 1.0):
+def fetch_with_retry(video_id: str, max_tries: int = 3, base_delay: float = 2.0):
     """
-    Streng seriell, kleine Retries mit Jitter.
+    Streng seriell, kleine Retries mit Jitter und Rate-Limit-Handling.
     """
     ytt = build_ytt_api(video_id)
-    last_er = None
+    last_err: Exception | None = None
+
     for attempt in range(1, max_tries + 1):
+        wait_for_youtube_slot(attempt)
         try:
             text, lang = fetch_captions_once(ytt, video_id)
             if text:
-                return text, (lang or "de/en")
+                return text, lang, None
             # Keine Transkripte vorhanden -> kein weiterer Retry nötig
-            return None, None
-        except (NoTranscriptFound, TranscriptsDisabled):
-            return None, None
+            return None, None, "Keine Untertitel wurden von YouTube geliefert."
+        except (NoTranscriptFound, TranscriptsDisabled) as e:
+            return None, None, f"{e.__class__.__name__}: {e}"
+        except (IpBlocked, RequestBlocked) as e:
+            last_err = e
+            if attempt < max_tries:
+                cooldown = base_delay * (2 ** (attempt - 1)) * random.uniform(1.5, 2.3)
+                time.sleep(min(cooldown, 60.0))
+                continue
+            raise RateLimitError(
+                "YouTube hat den Abruf stark gedrosselt. Bitte mindestens 15 Minuten warten und erneut versuchen."
+            ) from e
+        except YouTubeRequestFailed as e:
+            last_err = e
+            if attempt < max_tries:
+                delay = base_delay * (2 ** (attempt - 1)) * random.uniform(0.9, 1.3)
+                time.sleep(min(delay, 20.0))
+                continue
         except Exception as e:
             last_err = e
             if attempt < max_tries:
                 delay = base_delay * (2 ** (attempt - 1)) * random.uniform(0.9, 1.2)
                 time.sleep(min(delay, 6.0))
                 continue
+        finally:
+            mark_youtube_request()
+
     # nach max_tries gescheitert
     print(f"Transcript fetch failed after {max_tries} tries. Last error: {last_err}")
-    raise RuntimeError(f"Transcript fetch failed after {max_tries} tries. Last error: {last_err}")
+    raise RuntimeError(
+        f"Transcript fetch failed after {max_tries} tries. Last error: {last_err}"
+    )
 
 def normalize_urls(urls: list[str]) -> list[str]:
     out = []
@@ -268,20 +352,28 @@ app.layout = html.Div(
                 ),
             ],
         ),
-        html.Div(id="status", style={"marginTop": "10px", "color": "#555"}),
-        html.Div(id="caption_info", style={"marginTop": "6px", "color": "#0a7f3f"}),
-        html.Div(id="warning_info", style={"marginTop": "6px", "color": "#b06500"}),
-        html.Hr(),
-        dash_table.DataTable(
-            id="facts_table",
-            columns=[
-                {"name": "Aussage", "id": "claim"},
-                {"name": "Bewertung", "id": "verdict"},
-                {"name": "Quellen", "id": "sources"},
+        dcc.Loading(
+            id="caption_loading",
+            type="circle",
+            color="#2563eb",
+            delay_show=400,
+            children=[
+                html.Div(id="status", style={"marginTop": "10px", "color": "#555"}),
+                html.Div(id="caption_info", style={"marginTop": "6px", "color": "#0a7f3f"}),
+                html.Div(id="warning_info", style={"marginTop": "6px", "color": "#b06500"}),
+                html.Hr(),
+                dash_table.DataTable(
+                    id="facts_table",
+                    columns=[
+                        {"name": "Aussage", "id": "claim"},
+                        {"name": "Bewertung", "id": "verdict"},
+                        {"name": "Quellen", "id": "sources"},
+                    ],
+                    data=[],
+                    style_cell={"whiteSpace": "pre-line", "fontSize": 14},
+                    style_table={"overflowX": "auto"},
+                ),
             ],
-            data=[],
-            style_cell={"whiteSpace": "pre-line", "fontSize": 14},
-            style_table={"overflowX": "auto"},
         ),
     ],
 )
@@ -319,32 +411,50 @@ def run_pipeline(n_clicks, n_submit, url):
         # (2) Cache prüfen
         cached_text, cached_lang = get_cached_transcript(video_id)
         if cached_text:
+            clear_transcript_failure(video_id)
             facts = openai_facts(cached_text, lang_hint=cached_lang or "de")
             return ("Faktenprüfung abgeschlossen (aus Cache).",
                     f"Untertitel (Cache) – Sprache: {cached_lang or 'de/en'}.",
                     "",
                     [{"claim": x["claim"], "verdict": x["verdict"], "sources": "\n".join(x["sources"])} for x in facts])
 
-        # (4)+(3)+(1) Strenger, bot-sicherer Fetch der Untertitel (seriell, 2 Retries, 1 Sprachliste, Proxy nur für YT)
+        recent_failure = get_recent_transcript_failure(video_id)
+        if recent_failure:
+            return ("", "", recent_failure, [])
+        
+        # (4)+(3)+(1) Strenger, bot-sicherer Fetch der Untertitel (seriell, Retries, 1 Sprachliste, Proxy nur für YT)
         try:
-            text, lang = fetch_with_retry(video_id, max_tries=2, base_delay=1.0)
+            text, lang = fetch_with_retry(video_id)
+        except RateLimitError as e:
+            message = str(e) or "YouTube hat den Abruf stark gedrosselt."
+            mark_transcript_failure(video_id, message, ttl=YOUTUBE_FAILURE_TTL)
+            print(f"Rate limit while fetching transcript for {video_id}: {e}")
+            return ("", "", message, [])
         except RuntimeError as e:
-            # Zu viele 429 / Sorry-Pages / Netzfehler
-            return ("", "", "YouTube hat den Abruf gedrosselt. Bitte später erneut versuchen oder anderes Video testen.", [])
+            message = "YouTube hat den Abruf gedrosselt. Bitte später erneut versuchen oder anderes Video testen."
+            mark_transcript_failure(video_id, message, ttl=YOUTUBE_FAILURE_TTL / 2)
+            print(f"Transcript fetch failed for {video_id}: {e}")
+            return ("", "", message, [])
 
         if not text:
             # Keine Untertitel vorhanden oder deaktiviert
-            return ("", "", "Für dieses Video sind keine Untertitel verfügbar. Bitte anderes Video probieren.", [])
+            warn = "Für dieses Video sind keine Untertitel verfügbar. Bitte anderes Video probieren."
+            detail = yt_message or "Keine weiteren Details von YouTube."
+            message = "Für dieses Video sind keine Untertitel verfügbar. Bitte anderes Video probieren."
+            mark_transcript_failure(video_id, message, ttl=YOUTUBE_TRANSCRIPT_MISS_TTL)
+            return ("", "", message, [])
+            return ("", "", message + f"youtube returned the following: {detail}", [])
 
         # (2) Cache setzen
         set_cached_transcript(video_id, text, lang)
+        clear_transcript_failure(video_id)
 
         # LLM‑Faktenprüfung (ohne Proxy)
         facts = openai_facts(text, lang_hint=lang or "de")
 
         rows = [{"claim": x["claim"], "verdict": x["verdict"], "sources": "\n".join(x["sources"])} for x in facts]
         return ("Faktenprüfung abgeschlossen.",
-                f"Untertitel gefunden (Quelle: YouTube, Sprache: {lang}).",
+                f"Untertitel gefunden (Quelle: YouTube, Sprache: {lang or 'de/en'}).",
                 "",
                 rows)
 
