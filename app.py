@@ -1,16 +1,14 @@
 import os
-import glob
 import json
 import re
 import time
-import tempfile
 import threading
 from urllib.parse import urlparse, parse_qs
 
 import httpx
 from dash import Dash, html, dcc, dash_table, Input, Output, State
-from yt_dlp import YoutubeDL
-from yt_dlp.utils import DownloadError
+from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
+from youtube_transcript_api._errors import TooManyRequests, CouldNotRetrieveTranscript
 
 class TranscriptFetchError(RuntimeError):
     """Technischer Fehler beim Laden der Untertitel."""
@@ -30,13 +28,6 @@ FACTCHECK_LOCK = threading.Lock()
 # Cache-Verzeichnis (persistiert pro Kaltstart; auf Render /tmp möglich)
 CACHE_DIR = "/tmp/yt_caps_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
-
-# Realistischer User-Agent nur für YT
-YT_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
 
 # Welche Sprachen sollen priorisiert werden?
 SUBTITLE_LANG_PREF = [
@@ -146,192 +137,70 @@ def vtt_to_text(vtt: str) -> str:
     vtt = re.sub(r"\s*\n\s*\n+", "\n", vtt)
     return vtt.strip()
 
-def _needs_login(err: Exception) -> bool:
-    detail = str(err)
-    return "Sign in to confirm you're not a bot" in detail
-
-def _match_language_key(pool: dict, wanted: str) -> str | None:
-    """
-    Sucht zu einer gewünschten Sprache (z.B. 'de') einen konkreten Key (z.B. 'de-DE').
-    """
-    if not pool or not wanted:
-        return None
-    wanted = wanted.lower()
-    for key in pool:
-        if key.lower() == wanted and pool.get(key):
-            return key
-    for key in pool:
-        base = key.split("-")[0].lower()
-        if base == wanted and pool.get(key):
-            return key
-    return None
-
-def _detect_primary_audio_language(info: dict) -> str | None:
-    """
-    Versucht die Hauptsprache des Videos aus den Metadaten zu bestimmen.
-    """
-    for key in (
-        "language",
-        "audio_language",
-        "default_audio_language",
-        "default_language",
-        "original_language",
-    ):
-        value = info.get(key)
-        if value:
-            return value.split("-")[0].lower()
-    return None
-
-def _order_preferences(info: dict, preferred: list[str]) -> list[str]:
-    """
-    Sortiert die Wunschsprachen so, dass die erkannte Hauptsprache ganz vorne steht.
-    """
-    preferred = [
-        lang.lower()
-        for lang in (preferred or SUBTITLE_LANG_PREF)
-        if lang and lang.lower() in SUBTITLE_LANG_PREF_SET
-    ]
-    primary = _detect_primary_audio_language(info)
-    if primary not in SUBTITLE_LANG_PREF_SET:
-        primary = None
-    ordered: list[str] = []
-    if primary:
-        ordered.append(primary)
-    for lang in preferred:
-        if lang not in ordered:
-            ordered.append(lang)
-    if not ordered:
-        ordered = SUBTITLE_LANG_PREF.copy()
-    return ordered
-
-def _rank_caption_candidates(info: dict, preferred_order: list[str]) -> list[tuple[str, str]]:
-    """
-    Liefert eine geordnete Liste (Sprache, Quelle) mit manuellen Untertiteln vor automatischen.
-    """
-    manual = info.get("subtitles") or {}
-    automatic = info.get("automatic_captions") or {}
-    candidates: list[tuple[str, str]] = []
-
-    def add_from_pool(pool: dict, kind: str):
-        seen: set[str] = set()
-        for lang in preferred_order:
-            match = _match_language_key(pool, lang)
-            if match and match not in seen:
-                candidates.append((match, kind))
-                seen.add(match)
-
-    add_from_pool(manual, "manual")
-    add_from_pool(automatic, "auto")
-    return candidates
-
 def _normalize_lang_hint(lang: str | None) -> str | None:
     if not lang:
         return None
     return lang.split("-")[0].lower()
 
-def fetch_captions_with_ytdlp(video_id: str, languages: list[str] | None = None):
+def fetch_public_captions(video_id: str, languages: list[str] | None = None):
     """
-    Lädt Untertitel via yt-dlp ohne Proxy und gibt bereinigten Text zurück.
+    Verwendet ausschließlich öffentlich verfügbare Untertitel über die YouTube Transcript API.
     """
     languages = [lang.lower() for lang in languages] if languages else SUBTITLE_LANG_PREF
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        outtmpl = os.path.join(tmp_dir, "%(id)s.%(lang)s.%(ext)s")
-        ydl_opts = {
-            "skip_download": True,
-            "writesubtitles": True,
-            "writeautomaticsub": True,
-            "subtitleslangs": languages,
-            "subtitlesformat": "vtt",
-            "outtmpl": outtmpl,
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-            "http_headers": {"User-Agent": YT_USER_AGENT},
-        }
 
-        try:
-            with YoutubeDL(ydl_opts) as ydl:
-                try:
-                    info = ydl.extract_info(url, download=False)
-                except DownloadError as e:
-                    if _needs_login(e):
-                        raise TranscriptFetchError(
-                            "Dieses Video stellt seine Untertitel nicht öffentlich bereit. Bitte wähle ein anderes Video mit öffentlichen Untertiteln."
-                        ) from e
-                    raise TranscriptFetchError(
-                        "Metadaten konnten nicht von YouTube geladen werden."
-                    ) from e
-                except Exception as e:
-                    raise TranscriptFetchError(
-                        "Unerwarteter Fehler beim Abrufen der Videometadaten. Nur Videos mit englischer oder deutscher Sprache können analysiert werden!"
-                    ) from e
-
-                ordered_pref = _order_preferences(info, languages)
-                candidates = _rank_caption_candidates(info, ordered_pref)
-                if not candidates:
-                    raise TranscriptUnavailableError(
-                        "Keine passenden Untertitelsprachen wurden von YouTube gemeldet."
-                    )
-
-                last_error: Exception | None = None
-                for target_lang, source_type in candidates:
-                    ydl.params["subtitleslangs"] = [target_lang]
-                    ydl.params["writesubtitles"] = source_type == "manual"
-                    ydl.params["writeautomaticsub"] = source_type != "manual"
-                    try:
-                        ydl.download([url])
-                    except DownloadError as e:
-                        if _needs_login(e):
-                            raise TranscriptFetchError(
-                                "Dieses Video stellt seine Untertitel nicht öffentlich bereit. Bitte ein anderes Video mit öffentlichen Untertiteln wählen."
-                            ) from e
-                        last_error = e
-                        continue
-                    except Exception as e:
-                        last_error = e
-                        continue
-
-                    pattern = os.path.join(tmp_dir, f"{video_id}.{target_lang}*.vtt")
-                    files = sorted(glob.glob(pattern))
-                    if not files:
-                        last_error = FileNotFoundError(
-                            f"Keine Untertiteldatei für Sprache '{target_lang}' gefunden."
-                        )
-                        continue
-
-                    for file_path in files:
-                        try:
-                            with open(file_path, "r", encoding="utf-8") as fh:
-                                raw_vtt = fh.read()
-                        except OSError:
-                            continue
-
-                        cleaned = vtt_to_text(raw_vtt)
-                        if cleaned:
-                            lang_hint = _normalize_lang_hint(target_lang)
-                            return cleaned, lang_hint
-                    last_error = TranscriptUnavailableError(
-                        f"Die Untertiteldatei für '{target_lang}' enthielt keinen Text."
-                    )
-
-                if last_error:
-                    raise TranscriptFetchError(
-                        f"Untertitel konnten nicht geladen werden. Letzter Fehler: {last_error}"
-                    ) from last_error
-                raise TranscriptFetchError("Untertitel konnten nicht geladen werden.")
-        except DownloadError as e:
-            raise TranscriptFetchError(
-                "Untertitel konnten nicht von YouTube geladen werden."
-            ) from e
-        except Exception as e:
-            raise TranscriptFetchError(
-                "Unerwarteter Fehler beim Laden der Untertitel."
-            ) from e
-
+    try:
+        transcripts = YouTubeTranscriptApi.list_transcripts(video_id)
+    except TranscriptsDisabled as e:
         raise TranscriptUnavailableError(
-            "Für dieses Video sind keine Untertitel verfügbar."
-        )
+            "Für dieses Video wurden keine öffentlichen Untertitel freigeschaltet."
+        ) from e
+    except NoTranscriptFound as e:
+        raise TranscriptUnavailableError(
+            "Für dieses Video sind keine öffentlichen Untertitel verfügbar."
+        ) from e
+    except TooManyRequests as e:
+        raise TranscriptFetchError(
+            "YouTube hat zu viele Anfragen erkannt. Bitte einige Minuten warten und erneut versuchen."
+        ) from e
+    except CouldNotRetrieveTranscript as e:
+        raise TranscriptFetchError(
+            "Untertitel konnten nicht von YouTube geladen werden."
+        ) from e
+    except Exception as e:
+        raise TranscriptFetchError(
+            "Unerwarteter Fehler beim Abrufen der Untertitel."
+        ) from e
+
+    def try_fetch(language: str):
+        for finder in (
+            "find_manually_created_transcript",
+            "find_generated_transcript",
+            "find_transcript",
+        ):
+            method = getattr(transcripts, finder, None)
+            if not method:
+                continue
+            try:
+                transcript = method([language])
+                segments = transcript.fetch()
+                text = " ".join(
+                    (seg.get("text") or "").strip() for seg in segments if seg.get("text")
+                ).strip()
+                if text:
+                    lang_hint = _normalize_lang_hint(transcript.language_code or language)
+                    return text, lang_hint or language
+            except NoTranscriptFound:
+                continue
+        return None
+
+    for lang in languages:
+        result = try_fetch(lang)
+        if result:
+            return result
+
+    raise TranscriptUnavailableError(
+        f"Keine öffentlichen Untertitel in den gewünschten Sprachen verfügbar ({', '.join(languages)})."
+    )
 
 def normalize_urls(urls: list[str]) -> list[str]:
     out = []
@@ -550,9 +419,9 @@ def run_pipeline(n_clicks, n_submit, url):
             yt_detail = f"YouTube-Antwort: {recent_failure}"
             return ("", "", recent_failure, yt_detail, [])
         
-        # Untertitel laden (ohne Proxy, yt-dlp mit automatischen Subs)
+        # Untertitel laden (öffentliche YouTube-Captions)
         try:
-            text, lang = fetch_captions_with_ytdlp(video_id, SUBTITLE_LANG_PREF)
+            text, lang = fetch_public_captions(video_id, SUBTITLE_LANG_PREF)
         except TranscriptUnavailableError as e:
             message = str(e) or "Für dieses Video sind keine Untertitel verfügbar. Bitte anderes Video probieren."
             mark_transcript_failure(video_id, message, ttl=YOUTUBE_TRANSCRIPT_MISS_TTL)
