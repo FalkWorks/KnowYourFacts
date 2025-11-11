@@ -2,4 +2,3 @@ dash
 gunicorn
 yt-dlp
 httpx
-youtube-transcript-api
