@@ -7,8 +7,14 @@ from urllib.parse import urlparse, parse_qs
 
 import httpx
 from dash import Dash, html, dcc, dash_table, Input, Output, State
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
-from youtube_transcript_api._errors import TooManyRequests, CouldNotRetrieveTranscript
+from youtube_transcript_api import (
+    YouTubeTranscriptApi,
+    TranscriptsDisabled,
+    NoTranscriptFound,
+    CouldNotRetrieveTranscript,
+    RequestBlocked,
+    IpBlocked,
+)
 
 class TranscriptFetchError(RuntimeError):
     """Technischer Fehler beim Laden der Untertitel."""
@@ -158,7 +164,7 @@ def fetch_public_captions(video_id: str, languages: list[str] | None = None):
         raise TranscriptUnavailableError(
             "Für dieses Video sind keine öffentlichen Untertitel verfügbar."
         ) from e
-    except TooManyRequests as e:
+    except (RequestBlocked, IpBlocked) as e:
         raise TranscriptFetchError(
             "YouTube hat zu viele Anfragen erkannt. Bitte einige Minuten warten und erneut versuchen."
         ) from e
