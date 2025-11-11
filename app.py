@@ -153,59 +153,49 @@ def fetch_public_captions(video_id: str, languages: list[str] | None = None):
     Verwendet ausschließlich öffentlich verfügbare Untertitel über die YouTube Transcript API.
     """
     languages = [lang.lower() for lang in languages] if languages else SUBTITLE_LANG_PREF
-
-    try:
-        transcripts = YouTubeTranscriptApi.list_transcripts(video_id)
-    except TranscriptsDisabled as e:
-        raise TranscriptUnavailableError(
-            "Für dieses Video wurden keine öffentlichen Untertitel freigeschaltet."
-        ) from e
-    except NoTranscriptFound as e:
-        raise TranscriptUnavailableError(
-            "Für dieses Video sind keine öffentlichen Untertitel verfügbar."
-        ) from e
-    except (RequestBlocked, IpBlocked) as e:
-        raise TranscriptFetchError(
-            "YouTube hat zu viele Anfragen erkannt. Bitte einige Minuten warten und erneut versuchen."
-        ) from e
-    except CouldNotRetrieveTranscript as e:
-        raise TranscriptFetchError(
-            "Untertitel konnten nicht von YouTube geladen werden."
-        ) from e
-    except Exception as e:
-        raise TranscriptFetchError(
-            "Unerwarteter Fehler beim Abrufen der Untertitel."
-        ) from e
-
-    def try_fetch(language: str):
-        for finder in (
-            "find_manually_created_transcript",
-            "find_generated_transcript",
-            "find_transcript",
-        ):
-            method = getattr(transcripts, finder, None)
-            if not method:
-                continue
-            try:
-                transcript = method([language])
-                segments = transcript.fetch()
-                text = " ".join(
-                    (seg.get("text") or "").strip() for seg in segments if seg.get("text")
-                ).strip()
-                if text:
-                    lang_hint = _normalize_lang_hint(transcript.language_code or language)
-                    return text, lang_hint or language
-            except NoTranscriptFound:
-                continue
-        return None
+    last_not_found = False
 
     for lang in languages:
-        result = try_fetch(lang)
-        if result:
-            return result
+        try:
+            segments = YouTubeTranscriptApi.get_transcript(
+                video_id,
+                languages=[lang],
+            )
+        except TranscriptsDisabled as e:
+            raise TranscriptUnavailableError(
+                "Für dieses Video wurden keine öffentlichen Untertitel freigeschaltet."
+            ) from e
+        except (RequestBlocked, IpBlocked) as e:
+            raise TranscriptFetchError(
+                "YouTube hat zu viele Anfragen erkannt. Bitte einige Minuten warten und erneut versuchen."
+            ) from e
+        except CouldNotRetrieveTranscript as e:
+            raise TranscriptFetchError(
+                "Untertitel konnten nicht von YouTube geladen werden."
+            ) from e
+        except NoTranscriptFound:
+            last_not_found = True
+            continue
+        except Exception as e:
+            raise TranscriptFetchError(
+                "Unerwarteter Fehler beim Abrufen der Untertitel."
+            ) from e
+
+        text = " ".join(
+            (seg.get("text") or "").strip() for seg in segments if seg.get("text")
+        ).strip()
+        if text:
+            lang_hint = _normalize_lang_hint(lang)
+            return text, lang_hint or lang
+        last_not_found = True
+
+    if last_not_found:
+        raise TranscriptUnavailableError(
+            f"Keine öffentlichen Untertitel in den gewünschten Sprachen verfügbar ({', '.join(languages)})."
+        )
 
     raise TranscriptUnavailableError(
-        f"Keine öffentlichen Untertitel in den gewünschten Sprachen verfügbar ({', '.join(languages)})."
+        "Für dieses Video sind keine öffentlichen Untertitel verfügbar."
     )
 
 def normalize_urls(urls: list[str]) -> list[str]:
