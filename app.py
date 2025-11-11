@@ -49,10 +49,6 @@ if not SUBTITLE_LANG_PREF:
 SUBTITLE_LANG_PREF = [lang for lang in SUBTITLE_LANG_PREF if lang]
 SUBTITLE_LANG_PREF_SET = set(SUBTITLE_LANG_PREF)
 
-# Cookies (optional, falls YT Anmeldung erzwingt)
-YTDLP_COOKIES_FILE = os.getenv("YTDLP_COOKIES_FILE", "").strip()
-YTDLP_COOKIES_DATA = os.getenv("YTDLP_COOKIES_DATA", "")
-
 # TTLs für Fehler-Caching
 YOUTUBE_FAILURE_TTL = float(os.getenv("YOUTUBE_FAILURE_TTL", "900"))  # Sekunden
 YOUTUBE_TRANSCRIPT_MISS_TTL = float(
@@ -150,30 +146,9 @@ def vtt_to_text(vtt: str) -> str:
     vtt = re.sub(r"\s*\n\s*\n+", "\n", vtt)
     return vtt.strip()
 
-def _prepare_cookiefile(tmp_dir: str) -> str | None:
-    if YTDLP_COOKIES_FILE:
-        if os.path.exists(YTDLP_COOKIES_FILE):
-            return YTDLP_COOKIES_FILE
-        raise TranscriptFetchError(
-            f"Set YTDLP_COOKIES_FILE verweist auf eine nicht vorhandene Datei: {YTDLP_COOKIES_FILE}"
-        )
-    if YTDLP_COOKIES_DATA:
-        cookie_path = os.path.join(tmp_dir, "yt_cookies.txt")
-        with open(cookie_path, "w", encoding="utf-8") as cf:
-            cf.write(YTDLP_COOKIES_DATA)
-        return cookie_path
-    return None
-
 def _needs_login(err: Exception) -> bool:
     detail = str(err)
     return "Sign in to confirm you're not a bot" in detail
-
-def _extract_lang_from_filename(path: str) -> str | None:
-    base = os.path.basename(path)
-    parts = base.rsplit(".", 2)
-    if len(parts) >= 2:
-        return parts[-2]
-    return None
 
 def _match_language_key(pool: dict, wanted: str) -> str | None:
     """
@@ -274,18 +249,15 @@ def fetch_captions_with_ytdlp(video_id: str, languages: list[str] | None = None)
             "noplaylist": True,
             "http_headers": {"User-Agent": YT_USER_AGENT},
         }
-        cookiefile = _prepare_cookiefile(tmp_dir)
-        if cookiefile:
-            ydl_opts["cookiefile"] = cookiefile
 
         try:
             with YoutubeDL(ydl_opts) as ydl:
                 try:
                     info = ydl.extract_info(url, download=False)
                 except DownloadError as e:
-                    if _needs_login(e) and not cookiefile:
+                    if _needs_login(e):
                         raise TranscriptFetchError(
-                            "YouTube verlangt eine Anmeldung. Bitte setze YTDLP_COOKIES_FILE oder YTDLP_COOKIES_DATA mit exportierten Cookies."
+                            "Dieses Video stellt seine Untertitel nicht öffentlich bereit. Bitte wähle ein anderes Video mit öffentlichen Untertiteln."
                         ) from e
                     raise TranscriptFetchError(
                         "Metadaten konnten nicht von YouTube geladen werden."
@@ -310,10 +282,9 @@ def fetch_captions_with_ytdlp(video_id: str, languages: list[str] | None = None)
                     try:
                         ydl.download([url])
                     except DownloadError as e:
-                        if _needs_login(e) and not cookiefile:
+                        if _needs_login(e):
                             raise TranscriptFetchError(
-                                "YouTube verlangt eine Anmeldung. Bitte setze YTDLP_COOKIES_FILE (Pfad zur exportierten Cookies-Datei im Netscape-Format) "
-                                "oder YTDLP_COOKIES_DATA (Inhalt der Datei)."
+                                "Dieses Video stellt seine Untertitel nicht öffentlich bereit. Bitte ein anderes Video mit öffentlichen Untertiteln wählen."
                             ) from e
                         last_error = e
                         continue
